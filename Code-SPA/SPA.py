@@ -578,7 +578,9 @@ def main_SPA(main_data, main_data_y = None, test_data = None, test_data_y = None
         pickle.dump(fitting_result, f)
     # Saving as a json file
     with open(f'SPA_results_{time_now}.json', 'w') as f:
-        json.dump(fr2, f, indent = 4)
+        # Numpy scalars (e.g. PLS n_components as int64) are not caught by the ndarray
+        # conversion above and are not JSON-serializable; convert them on the fly.
+        json.dump(fr2, f, indent = 4, default = lambda o: o.item() if isinstance(o, np.generic) else str(o))
     if verbosity_level: print(f'The best model is {selected_model}. View its results via fitting_result["{selected_model}"] or by opening the SPA_results json/pickle files.')
     if verbosity_level >= 2 and not classification: print(f'Train set: RMSE = {fitting_result[selected_model]["RMSE_train_nontrans"]:.4f} | Mean relative error = {fitting_result[selected_model]["Mean_relative_error_train"]:.4f}')
     if verbosity_level and not classification: print(f'Test set : RMSE = {fitting_result[selected_model]["RMSE_test_nontrans"]:.4f} | Mean relative error = {fitting_result[selected_model]["Mean_relative_error_test"]:.4f}')
