@@ -2,10 +2,10 @@ import statsmodels.api as sm
 from SPLS_Python import SPLS
 from sklearn.linear_model import LinearRegression, ElasticNet, LogisticRegression
 from sklearn.cross_decomposition import PLSRegression
+import skglm
 from sklearn.preprocessing import StandardScaler, PolynomialFeatures
 from sklearn.metrics import mean_squared_error as MSE
 from sklearn.metrics import confusion_matrix
-# from sklearn.metrics import log_loss
 from torch import Tensor, LongTensor
 from torch.nn import CrossEntropyLoss
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, AdaBoostRegressor, RandomForestClassifier, GradientBoostingClassifier, AdaBoostClassifier
@@ -14,7 +14,7 @@ import numpy as np
 import warnings
 warnings.filterwarnings("ignore") # TODO: Want to just ignore the PLS constant residual warnings, but this will do for now
 
-def OLS_fitting(X, y, X_test, y_test, classification = False, class_weight = None, random_state = 0):
+def OLS_fitting(X, y, X_test, y_test, classification = False, random_state = 0):
     """
     Fits data using ordinary least squares: y = a*x1 + b*x2 + ...
 
@@ -26,9 +26,6 @@ def OLS_fitting(X, y, X_test, y_test, classification = False, class_weight = Non
         Testing data predictors and response.
     classification : bool, optional, default = False
         Whether to train a model for a classification (True) or regression (False) task.
-    class_weight : array, optional, default = None
-        The class weights for each class.
-        SPA automatically sets this to an array of ones (equal weights) if the user did not input anything to SPA.main_SPA()
     random_state : int or None, optional, default = 0
         Seed for the random number generator. Relevant only when classification == True.
     """
@@ -40,15 +37,13 @@ def OLS_fitting(X, y, X_test, y_test, classification = False, class_weight = Non
         loss_train = MSE(y, yhat_train)
         loss_test = MSE(y_test, yhat_test)
     else:
-        if class_weight is None:
-            class_weight = np.ones(len( set(y.squeeze()) ))
         OLS_model = LogisticRegression(penalty = None, solver = 'saga', multi_class = 'multinomial', random_state = random_state).fit(X, y)
         yhat_train = OLS_model.predict_proba(X)
         yhat_test = OLS_model.predict_proba(X_test)
-        pred_class_train = yhat_train.argmax(axis=1)
-        loss_train = _classification_score(y, pred_class_train, class_weight)
-        pred_class_test = yhat_test.argmax(axis=1)
-        loss_test = _classification_score(y_test, pred_class_test, class_weight)
+        pred_class_train = yhat_train.argmax(axis=1) + y.min() # y.min() is a correction because classes may not start from 0
+        loss_train = _classification_score(y, pred_class_train)
+        pred_class_test = yhat_test.argmax(axis=1) + y.min() # y.min() is a correction because classes may not start from 0
+        loss_test = _classification_score(y_test, pred_class_test)
     OLS_params = OLS_model.coef_
     return(OLS_model, OLS_params, loss_train, loss_test, yhat_train, yhat_test)
 
@@ -84,7 +79,7 @@ def SPLS_fitting(X, y, X_test, y_test, K = None, eta = None, eps = 1e-4, maxstep
 
     return SPLS_model, SPLS_params, mse_train, mse_test, yhat_train, yhat_test
 
-def EN_fitting(X, y, X_test, y_test, alpha, l1_ratio, max_iter = 10000, tol = 1e-4, random_state = 0, classification = False, class_weight = None):
+def EN_fitting(X, y, X_test, y_test, alpha, l1_ratio, max_iter = 10000, tol = 1e-4, random_state = 0, classification = False):
     """
     Fits data using sklearn's Elastic Net model
 
@@ -100,13 +95,12 @@ def EN_fitting(X, y, X_test, y_test, alpha, l1_ratio, max_iter = 10000, tol = 1e
         Ratio of L1 penalty to total penalty. When l1_ratio == 1, only the L1 penalty is used.
     max_iter : int, optional, default = 10000
         The maximum number of iterations
+    tol : float, optional, default 1e-4
+        The tolerance for the optimization. See sklearn's documentation for more detail.
     random_state : int or None, optional, default = 0
         Seed for the random number generator.
     classification : bool, optional, default = False
         Whether to train a model for a classification (True) or regression (False) task.
-    class_weight : array, optional, default = None
-        The class weights for each class.
-        SPA automatically sets this to an array of ones (equal weights) if the user did not input anything to SPA.main_SPA()
     """
     if not classification:
         EN_model = ElasticNet(alpha = alpha, l1_ratio = l1_ratio, random_state = random_state, fit_intercept = False, max_iter = max_iter, tol = tol)
@@ -116,23 +110,57 @@ def EN_fitting(X, y, X_test, y_test, alpha, l1_ratio, max_iter = 10000, tol = 1e
         loss_train = MSE(y, yhat_train)
         loss_test = MSE(y_test, yhat_test)
     else:
-        if class_weight is None:
-            class_weight = np.ones(len( set(y.squeeze()) ))
-        EN_model = LogisticRegression(penalty = 'elasticnet', C = 1/alpha, l1_ratio = l1_ratio, solver = 'saga', multi_class = 'multinomial', random_state = random_state).fit(X, y)
+        EN_model = LogisticRegression(penalty = 'elasticnet', C = 1/alpha, l1_ratio = l1_ratio, solver = 'saga', multi_class = 'multinomial', random_state = random_state, max_iter = max_iter, tol = tol).fit(X, y)
         yhat_train = EN_model.predict_proba(X)
         yhat_test = EN_model.predict_proba(X_test)
-        pred_class_train = yhat_train.argmax(axis=1)
-        loss_train = _classification_score(y, pred_class_train, class_weight)
-        pred_class_test = yhat_test.argmax(axis=1)
-        loss_test = _classification_score(y_test, pred_class_test, class_weight)
+        pred_class_train = yhat_train.argmax(axis=1) + y.min() # y.min() is a correction because classes may not start from 0
+        loss_train = _classification_score(y, pred_class_train)
+        pred_class_test = yhat_test.argmax(axis=1) + y.min() # y.min() is a correction because classes may not start from 0
+        loss_test = _classification_score(y_test, pred_class_test)
     EN_params = EN_model.coef_
     return (EN_model, EN_params, loss_train, loss_test, yhat_train, yhat_test)
 
+def GenLinEstimator_fitting(X, y, X_test, y_test, penalty_type, penalty_hyper, max_iter = 10000, tol = 1e-4, random_state = 0, classification = False):
+    """
+    Fits data using skglm's generalized linear model. Used for SCAD or MCP models in this software
+
+    Parameters
+    ----------
+    X, y : Numpy array with shape N x m, N x 1
+        Training data predictors and response.
+    X_test, y_test : Numpy array with shape N_test x m, N_test x 1
+        Testing data predictors and response.
+    penalty_type : string
+        A string representing the penalty type to be used. Currently, must be in {'SCAD', 'MCP'}.
+    penalty_hyper : float or array of floats
+        Hyperparameters for the penalties, such as alpha for SCAD and [alpha, gamma] for MCP.
+    max_iter : int, optional, default = 10000
+        The maximum number of iterations
+    random_state : int or None, optional, default = 0
+        Seed for the random number generator.
+    classification : bool, optional, default = False
+        Whether to train a model for a classification (True) or regression (False) task.
+    """
+    if penalty_type == 'SCAD':
+        my_penalty = skglm.penalties.SCAD(alpha = penalty_hyper, gamma = 3.7) # set a = 3.7 as recommended by the original work. SCAD should be invariant to changes in a
+    elif penalty_type == 'MCP':
+        my_penalty = skglm.penalties.MCPenalty(alpha = penalty_hyper[0], gamma = penalty_hyper[1])
+    if not classification:
+        GenLin_model = skglm.GeneralizedLinearEstimator(penalty = my_penalty)
+        GenLin_model.fit(X, y)
+        yhat_train = GenLin_model.predict(X)
+        yhat_test = GenLin_model.predict(X_test)
+        loss_train = MSE(y, yhat_train)
+        loss_test = MSE(y_test, yhat_test)
+    GenLin_params = GenLin_model.coef_
+    return (GenLin_model, GenLin_params, loss_train, loss_test, yhat_train, yhat_test)
+
+
 def LCEN_fitting(X, y, X_test, y_test, alpha, l1_ratio, degree = 1, lag = 0, min_lag = 0, trans_type = 'all', interaction = True, selection = None, transform_y = False,
-                 all_pos_X = None, all_pos_y = True, scale_X = True, scale_y = True, classification = False, class_weight = None):
+                 all_pos_X = None, all_pos_y = True, scale_X = True, scale_y = True, random_state = 0, classification = False):
     """
     Fits data using the LASSO-Clip-EN (LCEN) algorithm (doi.org/10.48550/arXiv.2402.17120).
-    LCEN is a powerful, non-linear, and interpretable feature selection algorithm with considerable feature selection capabilities, model accuracy, and speed.
+    LCEN is a nonlinear, interpretable feature selection and machine learning algorithm with considerable feature selection capabilities, model accuracy, and speed.
     LCEN was created as an upgrade to ALVEN, which was originally published in doi.org/10.1016/j.compchemeng.2020.107103
 
     Parameters
@@ -176,11 +204,10 @@ def LCEN_fitting(X, y, X_test, y_test, alpha, l1_ratio, degree = 1, lag = 0, min
             entries and some do not, as the number of features will vary per fold.
     scale_X, scale_y : boolean, optional, default = True
         Whether to scale the X/y data.
+    random_state : int or None, optional, default = 0
+        Seed for the random number generator.
     classification : bool, optional, default = False
         Whether to train a model for a classification (True) or regression (False) task.
-    class_weight : array, optional, default = None
-        The class weights for each class.
-        SPA automatically sets this to an array of ones (equal weights) if the user did not input anything to SPA.main_SPA()
     """
     if all_pos_X is None: # all_pos_X is never None, unless this function is called manually by the end-user
         all_pos_X = np.all(X >= 0, axis = 0)
@@ -196,9 +223,9 @@ def LCEN_fitting(X, y, X_test, y_test, alpha, l1_ratio, degree = 1, lag = 0, min
     # Adding variables from previous timesteps (t-1 to t-lag)
     if lag > 0:
         X_temp = np.hstack([X[lag-1-idx : -idx-1, :] for idx in range(min_lag, lag)]) # The additional entries representing the previous times (t-1 to t-lag)
-        y_temp = np.hstack([y[lag-1-idx : -idx-1] for idx in range(min_lag, lag)])
+        y_temp = np.hstack([y[lag-1-idx:] if idx == 0 else y[lag-1-idx : -idx] for idx in range(min_lag, lag)])[lag:]
         X_test_temp = np.hstack([np.concatenate((X[X.shape[0]-idx-1:, :], X_test[: -idx-1, :])) for idx in range(min_lag, lag)]) # No need to remove entries from X_test or y_test because we can use the data from the final points of X or y to predict the initial points of X_test or y_test
-        y_test_temp = np.hstack([np.concatenate((y[(len(y)-idx-1):],  y_test[: -idx-1])) for idx in range(min_lag, lag)])
+        y_test_temp = np.hstack([y_test if idx == 0 else np.concatenate((y[(len(y)-idx):],  y_test[:-idx])) for idx in range(min_lag, lag)])
         X = np.hstack((X[lag:], X_temp, y_temp))
         y = y[lag:]
         X_test = np.hstack((X_test, X_test_temp, y_test_temp))
@@ -235,14 +262,22 @@ def LCEN_fitting(X, y, X_test, y_test, alpha, l1_ratio, degree = 1, lag = 0, min
     if X.shape[1] == 0:
         LCEN_model = None
         LCEN_params = np.empty(0)
-        loss_train = np.var(y) # TODO: for classification, this is not var(y) but guessing only the majority class and calculating the metrics from there
-        loss_test = np.var(y_test)
-        yhat_train = np.zeros(y.shape) # Ok to be 0 because y is scaled --> mean(y) is approximately 0
-        yhat_test = np.zeros(y_test.shape)
+        if not classification:
+            loss_train = np.var(y)
+            loss_test = np.var(y_test)
+            yhat_train = np.zeros(y.shape) # Ok to be 0 because y is scaled --> mean(y) is approximately 0
+            yhat_test = np.zeros(y_test.shape)
+        else:
+            _, class_counts = np.unique(y, return_counts = True)
+            most_common_class = np.argmax(class_counts)
+            yhat_train = np.ones_like(y, dtype = int) * most_common_class
+            loss_train = _classification_score(y, yhat_train)
+            yhat_test = np.ones_like(y_test, dtype = int) * most_common_class
+            loss_test = _classification_score(y_test, yhat_test)
     else:
-        LCEN_model, LCEN_params, loss_train, loss_test, yhat_train, yhat_test = EN_fitting(X, y, X_test, y_test, alpha, l1_ratio, classification = classification, class_weight = class_weight)
+        LCEN_model, LCEN_params, loss_train, loss_test, yhat_train, yhat_test = EN_fitting(X, y, X_test, y_test, alpha, l1_ratio, classification = classification)
+    # Calculating information criteria values
     if not classification:
-        # Calculating information criteria values
         num_train = X.shape[0] # Typically written as n
         num_parameter = (LCEN_params!=0).flatten().sum() # Typically written as k
         AIC = num_train*np.log(loss_train) + 2*num_parameter # num_train * log(MSE) is one of the formulae to replace L. Shown in https://doi.org/10.1002/wics.1460, for example.
@@ -252,7 +287,7 @@ def LCEN_fitting(X, y, X_test, y_test, alpha, l1_ratio, degree = 1, lag = 0, min
         AIC, AICc, BIC = 0, 0, 0
     return (LCEN_model, LCEN_params, loss_train, loss_test, yhat_train, yhat_test, label_names, (AIC, AICc, BIC))
 
-def forest_fitting(X, y, X_test, y_test, n_estimators = 100, max_depth = 10, min_samples_leaf = 0.1, max_features = 1.0, learning_rate = None, random_state = 0, classification = False, class_weight = None):
+def forest_fitting(X, y, X_test, y_test, n_estimators = 100, max_depth = 10, min_samples_leaf = 0.1, max_features = 1.0, learning_rate = None, random_state = 0, classification = False):
     """
     Fits data using a random forest or gradient-boosted decision trees
 
@@ -280,9 +315,6 @@ def forest_fitting(X, y, X_test, y_test, n_estimators = 100, max_depth = 10, min
         Seed for the random number generator.
     classification : bool, optional, default = False
         Whether to train a model for a classification (True) or regression (False) task.
-    class_weight : array, optional, default = None
-        The class weights for each class.
-        SPA automatically sets this to an array of ones (equal weights) if the user did not input anything to SPA.main_SPA()
     """
     if (learning_rate is None or learning_rate == 0) and not classification:
         forest = RandomForestRegressor(n_estimators, max_depth = max_depth, random_state = random_state, max_features = max_features, min_samples_leaf = min_samples_leaf)
@@ -302,18 +334,16 @@ def forest_fitting(X, y, X_test, y_test, n_estimators = 100, max_depth = 10, min
         loss_train = MSE(y, yhat_train)
         loss_test = MSE(y_test, yhat_test)
     else:
-        if class_weight is None:
-            class_weight = np.ones(len( set(y.squeeze()) ))
         yhat_train = forest.predict_proba(X)
         yhat_test = forest.predict_proba(X_test)
-        pred_class_train = yhat_train.argmax(axis=1)
-        loss_train = _classification_score(y, pred_class_train, class_weight)
-        pred_class_test = yhat_test.argmax(axis=1)
-        loss_test = _classification_score(y_test, pred_class_test, class_weight)
+        pred_class_train = yhat_train.argmax(axis=1) + y.min() # y.min() is a correction because classes may not start from 0
+        loss_train = _classification_score(y, pred_class_train)
+        pred_class_test = yhat_test.argmax(axis=1) + y.min() # y.min() is a correction because classes may not start from 0
+        loss_test = _classification_score(y_test, pred_class_test)
 
     return (forest, loss_train, loss_test, yhat_train, yhat_test)
 
-def SVM_fitting(X, y, X_test, y_test, gamma = 'scale', C = 100, epsilon = 0.1, tol = 1e-4, max_iter = 10000, classification = False, class_weight = None):
+def SVM_fitting(X, y, X_test, y_test, gamma = 'scale', C = 100, epsilon = 0.1, tol = 1e-4, max_iter = 10000, classification = False):
     """
     Support Vector Machine-based regression
 
@@ -336,9 +366,6 @@ def SVM_fitting(X, y, X_test, y_test, gamma = 'scale', C = 100, epsilon = 0.1, t
         The maximum number of iterations
     classification : bool, optional, default = False
         Whether to train a model for a classification (True) or regression (False) task.
-    class_weight : array, optional, default = None
-        The class weights for each class.
-        SPA automatically sets this to an array of ones (equal weights) if the user did not input anything to SPA.main_SPA()
     """
     if not classification:
         SVM_model = SVR(gamma = gamma, C = C, epsilon = epsilon, tol = tol, max_iter = max_iter)
@@ -352,18 +379,16 @@ def SVM_fitting(X, y, X_test, y_test, gamma = 'scale', C = 100, epsilon = 0.1, t
         loss_train = MSE(y, yhat_train)
         loss_test = MSE(y_test, yhat_test)
     else:
-        if class_weight is None:
-            class_weight = np.ones(len( set(y.squeeze()) ))
         yhat_train = SVM_model.predict_proba(X)
         yhat_test = SVM_model.predict_proba(X_test)
-        pred_class_train = yhat_train.argmax(axis=1)
-        loss_train = _classification_score(y, pred_class_train, class_weight)
-        pred_class_test = yhat_test.argmax(axis=1)
-        loss_test = _classification_score(y_test, pred_class_test, class_weight)
+        pred_class_train = yhat_train.argmax(axis=1) + y.min() # y.min() is a correction because classes may not start from 0
+        loss_train = _classification_score(y, pred_class_train)
+        pred_class_test = yhat_test.argmax(axis=1) + y.min() # y.min() is a correction because classes may not start from 0
+        loss_test = _classification_score(y_test, pred_class_test)
 
     return (SVM_model, loss_train, loss_test, yhat_train, yhat_test)
 
-def AdaBoost_fitting(X, y, X_test, y_test, n_estimators = 50, learning_rate = 0.1, random_state = 0, classification = False, class_weight = None):
+def AdaBoost_fitting(X, y, X_test, y_test, n_estimators = 50, learning_rate = 0.1, random_state = 0, classification = False):
     """
     Adaptive Boosting regression
 
@@ -383,9 +408,6 @@ def AdaBoost_fitting(X, y, X_test, y_test, n_estimators = 50, learning_rate = 0.
         Seed for the random number generator.
     classification : bool, optional, default = False
         Whether to train a model for a classification (True) or regression (False) task.
-    class_weight : array, optional, default = None
-        The class weights for each class.
-        SPA automatically sets this to an array of ones (equal weights) if the user did not input anything to SPA.main_SPA()
     """
     if not classification:
         AdaB_model = AdaBoostRegressor(n_estimators = n_estimators, learning_rate = learning_rate, loss = 'square', random_state = random_state)
@@ -399,14 +421,12 @@ def AdaBoost_fitting(X, y, X_test, y_test, n_estimators = 50, learning_rate = 0.
         loss_train = MSE(y, yhat_train)
         loss_test = MSE(y_test, yhat_test)
     else:
-        if class_weight is None:
-            class_weight = np.ones(len( set(y.squeeze()) ))
         yhat_train = AdaB_model.predict_proba(X)
         yhat_test = AdaB_model.predict_proba(X_test)
-        pred_class_train = yhat_train.argmax(axis=1)
-        loss_train = _classification_score(y, pred_class_train, class_weight)
-        pred_class_test = yhat_test.argmax(axis=1)
-        loss_test = _classification_score(y_test, pred_class_test, class_weight)
+        pred_class_train = yhat_train.argmax(axis=1) + y.min() # y.min() is a correction because classes may not start from 0
+        loss_train = _classification_score(y, pred_class_train)
+        pred_class_test = yhat_test.argmax(axis=1) + y.min() # y.min() is a correction because classes may not start from 0
+        loss_test = _classification_score(y_test, pred_class_test)
 
     return (AdaB_model, loss_train, loss_test, yhat_train, yhat_test)
 
@@ -549,16 +569,18 @@ def _feature_trans(X, X_test = None, degree = 2, interaction = True, trans_type 
 
     return (X_out, X_test_out, label_names)
 
-def _classification_score(y, pred_class, class_weight):
+def _classification_score(y, pred_class):
     """
     Returns the recall, precision, F1, and MCC for a given set of predictions
     """
     CM = confusion_matrix(y, pred_class)
     rec = np.diag(CM)/CM.sum(axis=1)
     pre = np.diag(CM)/CM.sum(axis=0)
+    pre[np.isnan(pre)] = 0 # If a class has no samples predicted as positive, its precision is NaN. Changing it to 0 to avoid NaNs here and in the F1 score
     f1 = 2/(1/rec + 1/pre)
     CM = CM.astype(float) # Converting to float to avoid overflow errors when calculating the MCC
-    MCC = (np.diag(CM).sum()*CM.sum() - (CM.sum(axis=0)*CM.sum(axis=1)).sum()) / (np.sqrt(CM.sum()**2 - (CM.sum(axis=0)**2).sum()) * np.sqrt(CM.sum()**2 - (CM.sum(axis=1)**2).sum()))
-    loss_dict = {'Recall per class': np.round(rec, 5), 'Mean Recall': round((class_weight*rec).sum()/class_weight.sum(), 5), 'Precision per class': np.round(pre, 5),
-                    'Mean Precision': round((class_weight*pre).sum()/class_weight.sum(), 5), 'F1 per class': np.round(f1, 5), 'Mean F1': round((class_weight*f1).sum()/class_weight.sum(), 5), 'MCC': round(MCC, 5)}
+    # The formula for the multiclass MCC comes from J. Gorodkin, "Comparing two K-category assignments by a K-category correlation coefficient", https://doi.org/10.1016/j.compbiolchem.2004.09.006
+    MCC = (np.diag(CM).sum()*CM.sum() - (CM.sum(axis=0)*CM.sum(axis=1)).sum()) / ( np.sqrt(CM.sum()**2 - (CM.sum(axis=0)**2).sum()) * np.sqrt(CM.sum()**2 - (CM.sum(axis=1)**2).sum()) + 1e-10) # 1e-10 to avoid division by 0 issues when the model predicts that all samples are positive or all are negative. The MCC is correctly reported as 0 in this case
+    loss_dict = {'Recall per class': np.round(rec, 5), 'Mean Recall': round(rec.sum()/CM.shape[0], 5), 'Precision per class': np.round(pre, 5), 'Mean Precision': round(pre.sum()/CM.shape[0], 5),
+                    'F1 per class': np.round(f1, 5), 'Mean F1': round(f1.sum()/CM.shape[0], 5), 'MCC': round(MCC, 5)}
     return loss_dict
