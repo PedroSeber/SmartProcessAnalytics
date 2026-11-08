@@ -13,7 +13,8 @@ from torch.utils.data import Dataset, DataLoader
 import pandas as pd
 from itertools import product
 from collections import OrderedDict
-from time import localtime
+from time import localtime, time
+from os.path import exists as os_exists
 
 def CVpartition(X, y, Type = 'Re_KFold', K = 5, Nr = 10, random_state = 0, group = None):
     """
@@ -46,11 +47,11 @@ def CVpartition(X, y, Type = 'Re_KFold', K = 5, Nr = 10, random_state = 0, group
         X, X_test, y, y_test = train_test_split(X, y, test_size = 1/K, random_state = random_state)
         yield (X, y, X_test, y_test)
     elif Type == 'kfold':
-        CV = KFold(n_splits = int(K))
+        CV = KFold(n_splits = int(K), shuffle = True, random_state = random_state)
         for train_index, val_index in CV.split(X, y):
             yield (X[train_index], y[train_index], X[val_index], y[val_index])
     elif Type == 'stratifiedkfold':
-        CV = StratifiedKFold(n_splits = int(K), shuffle = True, random_state = 123)
+        CV = StratifiedKFold(n_splits = int(K), shuffle = True, random_state = random_state)
         for train_index, val_index in CV.split(X, y):
             yield (X[train_index], y[train_index], X[val_index], y[val_index])
     elif Type == 're_kfold':
@@ -123,7 +124,7 @@ def CV_mse(model_name, X, y, X_test, y_test, X_unscaled = None, y_unscaled = Non
     # Setting up some general kwargs; these should exist in kwargs unless the user called this function manually, which is not recommended
     if 'robust_priority' not in kwargs:
         kwargs['robust_priority'] = False
-    if 'l1_ratio' not in kwargs:
+    if 'l1_ratio' not in kwargs or kwargs['l1_ratio'] is None:
         kwargs['l1_ratio'] = [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.97, 0.99]
     if 'alpha' not in kwargs: # Unusual scenario, since SPA passes a default kwargs['alpha'] == 20
         kwargs['alpha'] = np.concatenate(([0], np.logspace(-4.3, 0, 20)))
@@ -141,6 +142,10 @@ def CV_mse(model_name, X, y, X_test, y_test, X_unscaled = None, y_unscaled = Non
         kwargs['scale_y'] = True
     if 'verbosity_level' not in kwargs:
         kwargs['verbosity_level'] = 2
+    if 'model_random_state' not in kwargs:
+        kwargs['model_random_state'] = 0
+    if 'cv_random_state' not in kwargs:
+        kwargs['cv_random_state'] = 0
 
     if model_name == 'EN':
         hyperparam_prod = list(product(kwargs['l1_ratio'], kwargs['alpha']))
@@ -148,7 +153,7 @@ def CV_mse(model_name, X, y, X_test, y_test, X_unscaled = None, y_unscaled = Non
         Var = np.empty((len(kwargs['alpha']) * len(kwargs['l1_ratio']), K_fold*Nr)) * np.nan
 
         with Parallel(n_jobs = -1) as PAR:
-            for counter, (X_train, y_train, X_val, y_val) in enumerate(CVpartition(X_unscaled, y_unscaled, Type = cv_type, K = K_fold, Nr = Nr, group = group)):
+            for counter, (X_train, y_train, X_val, y_val) in enumerate(CVpartition(X_unscaled, y_unscaled, cv_type, K_fold, Nr, kwargs['cv_random_state'], group)):
                 # Rescaling here to avoid validation dataset leakage
                 if kwargs['scale_X'] and len(X.shape) == 2 and X.shape[1] > 0: # StandardScaler doesn't work with 3D arrays or with arrays that are 2D but empty in one dimension
                     scaler_x = StandardScaler(with_mean=True, with_std=True)
@@ -166,8 +171,8 @@ def CV_mse(model_name, X, y, X_test, y_test, X_unscaled = None, y_unscaled = Non
                 else:
                     y_train_scale = y_train
                     y_val_scale = y_val
-                temp = PAR(delayed(rm.EN_fitting)(X_train_scale, y_train_scale, X_val_scale, y_val_scale, this_prod[1], this_prod[0], classification = kwargs['classification'],
-                                    class_weight = kwargs['class_weight']) for this_prod in hyperparam_prod)
+                temp = PAR(delayed(rm.EN_fitting)(X_train_scale, y_train_scale, X_val_scale, y_val_scale, this_prod[1], this_prod[0], random_state = kwargs['model_random_state'],
+                                        classification = kwargs['classification']) for this_prod in hyperparam_prod)
                 if not kwargs['classification']:
                     _, temp_var_count, _, MSE_result[:, counter], _, _ = zip(*temp)
                 else:
@@ -195,8 +200,77 @@ def CV_mse(model_name, X, y, X_test, y_test, X_unscaled = None, y_unscaled = Non
         l1_ratio, alpha = hyperparam_prod[ind]
         hyperparams = {'alpha': alpha, 'l1_ratio': l1_ratio}
         # Fit the final model
-        EN_model, EN_params, loss_train, loss_test, yhat_train, yhat_test = rm.EN_fitting(X, y, X_test, y_test, alpha, l1_ratio, classification = kwargs['classification'], class_weight = kwargs['class_weight'])
+        EN_model, EN_params, loss_train, loss_test, yhat_train, yhat_test = rm.EN_fitting(X, y, X_test, y_test, alpha, l1_ratio, random_state = kwargs['model_random_state'], classification = kwargs['classification'])
         return(hyperparams, EN_model, EN_params, loss_train, loss_test, yhat_train, yhat_test, MSE_mean[ind])
+
+    if model_name in {'SCAD', 'MCP'}:
+        if model_name == 'SCAD':
+            hyperparam_prod = kwargs['alpha'] # alpha here is lambda in the original SCAD paper
+            hyperparam_keys = ['alpha'] # For the hyperparams dict below
+            MSE_result = np.empty((len(kwargs['alpha']), K_fold*Nr)) * np.nan
+            Var = np.empty((len(kwargs['alpha']), K_fold*Nr)) * np.nan
+        elif model_name == 'MCP':
+            if 'MCP_gamma' not in kwargs:
+                kwargs['MCP_gamma'] = [1, 1.5, 2, 2.5, 3, 3.5, 4]
+            hyperparam_prod = list(product(kwargs['alpha'], kwargs['MCP_gamma']))
+            hyperparam_keys = ['alpha', 'gamma'] # For the hyperparams dict below
+            MSE_result = np.empty((len(kwargs['alpha']) * len(kwargs['MCP_gamma']), K_fold*Nr)) * np.nan
+            Var = np.empty((len(kwargs['alpha']) * len(kwargs['MCP_gamma']), K_fold*Nr)) * np.nan
+
+        with Parallel(n_jobs = -1) as PAR:
+            for counter, (X_train, y_train, X_val, y_val) in enumerate(CVpartition(X_unscaled, y_unscaled, cv_type, K_fold, Nr, kwargs['cv_random_state'], group)):
+                # Rescaling here to avoid validation dataset leakage
+                if kwargs['scale_X'] and len(X.shape) == 2 and X.shape[1] > 0: # StandardScaler doesn't work with 3D arrays or with arrays that are 2D but empty in one dimension
+                    scaler_x = StandardScaler(with_mean=True, with_std=True)
+                    scaler_x.fit(X_train)
+                    X_train_scale = scaler_x.transform(X_train)
+                    X_val_scale = scaler_x.transform(X_val)
+                else:
+                    X_train_scale = X_train
+                    X_val_scale = X_val
+                if kwargs['scale_y'] and not kwargs['classification']:
+                    scaler_y = StandardScaler(with_mean=True, with_std=True)
+                    scaler_y.fit(y_train)
+                    y_train_scale = scaler_y.transform(y_train)
+                    y_val_scale = scaler_y.transform(y_val)
+                else:
+                    y_train_scale = y_train
+                    y_val_scale = y_val
+                temp = PAR(delayed(rm.GenLinEstimator_fitting)(X_train_scale, y_train_scale, X_val_scale, y_val_scale, model_name, this_prod, random_state = kwargs['model_random_state'],
+                                        classification = kwargs['classification']) for this_prod in hyperparam_prod)
+                if not kwargs['classification']:
+                    _, temp_var_count, _, MSE_result[:, counter], _, _ = zip(*temp)
+                else:
+                    _, temp_var_count, _, loss_dicts, _, _ = zip(*temp)
+                    MSE_result[:, counter] = [elem['MCC'] for elem in loss_dicts]
+                Var[:, counter] = [np.sum(elem != 0) for elem in temp_var_count]
+
+        MSE_mean = np.nanmean(MSE_result, axis = 1)
+        if not kwargs['classification']:
+            ind = np.nanargmin(MSE_mean) # Minimize the MSE
+        else:
+            ind = np.nanargmax(MSE_mean) # Maximize the MCC
+        if kwargs['robust_priority']:
+            MSE_std = np.nanstd(MSE_result, axis = 1)
+            MSE_min = MSE_mean[ind]
+            Var_num = np.nansum(Var, axis = 1) # Here, Var is n_hyperparams x n_folds, and Var_num is n_hyperparams
+            if not kwargs['classification']:
+                MSE_bar = MSE_min + MSE_std[ind]
+                ind = np.nonzero( Var_num == np.nanmin(Var_num[MSE_mean < MSE_bar]) )[0][0] # Hyperparams with the lowest number of variables but still within one stdev of the best MSE
+            else:
+                MSE_bar = MSE_min - MSE_std[ind] # Despite the name, MSE_min is more like MCC_max in this context
+                ind = np.nonzero( Var_num == np.nanmin(Var_num[MSE_mean > MSE_bar]) )[0][0] # Hyperparams with the lowest number of variables but still within one stdev of the best MCC
+
+        # Hyperparameter setup
+        if not '__iter__' in dir(hyperparam_prod[ind]): # hyperparam_prod[ind] is not an interable, likely because it has only one element. We need to turn it into a list
+            best_hyper = [hyperparam_prod[ind]]
+        else:
+            best_hyper = hyperparam_prod[ind]
+        hyperparams = {key: value for key, value in zip( hyperparam_keys, best_hyper )}
+        # Fit the final model
+        GenLin_model, GenLin_params, loss_train, loss_test, yhat_train, yhat_test = rm.GenLinEstimator_fitting(X, y, X_test, y_test, model_name, hyperparam_prod[ind], random_state = kwargs['model_random_state'], classification = kwargs['classification'])
+        return(hyperparams, GenLin_model, GenLin_params, loss_train, loss_test, yhat_train, yhat_test, MSE_mean[ind])
+
 
     elif model_name == 'SPLS' or model_name == 'PLS':
         if not(cv_type.startswith('Group')) and ('SPLS_K' not in kwargs or kwargs['SPLS_K'] is None): # For non-grouped CV types
@@ -214,7 +288,7 @@ def CV_mse(model_name, X, y, X_test, y_test, X_unscaled = None, y_unscaled = Non
         Var = np.empty((len(kwargs['SPLS_K']) * len(kwargs['SPLS_eta']), K_fold*Nr)) * np.nan # Var is n_hyperparams x n_folds because rm.SPLS_fitting() can return a different number of variables each time, so we do some processing to directly save the number of variables in the Var array
 
         with Parallel(n_jobs = -1) as PAR:
-            for counter, (X_train, y_train, X_val, y_val) in enumerate(CVpartition(X_unscaled, y_unscaled, Type = cv_type, K = K_fold, Nr = Nr, group = group)):
+            for counter, (X_train, y_train, X_val, y_val) in enumerate(CVpartition(X_unscaled, y_unscaled, cv_type, K_fold, Nr, kwargs['cv_random_state'], group)):
                 # Rescaling here to avoid validation dataset leakage
                 if kwargs['scale_X'] and len(X.shape) == 2 and X.shape[1] > 0: # StandardScaler doesn't work with 3D arrays or with arrays that are 2D but empty in one dimension
                     scaler_x = StandardScaler(with_mean=True, with_std=True)
@@ -248,7 +322,7 @@ def CV_mse(model_name, X, y, X_test, y_test, X_unscaled = None, y_unscaled = Non
 
         # Hyperparameter setup
         K, eta = hyperparam_prod[ind]
-        hyperparams = {'K': int(K), 'eta': eta}
+        hyperparams = {'K': int(K), 'eta': float(eta)}
         # Fit the final model
         SPLS_model, SPLS_params, mse_train, mse_test, yhat_train, yhat_test = rm.SPLS_fitting(X, y, X_test, y_test, eta = eta, K = K)
         return(hyperparams, SPLS_model, SPLS_params, mse_train, mse_test, yhat_train, yhat_test, MSE_mean[ind])
@@ -266,57 +340,78 @@ def CV_mse(model_name, X, y, X_test, y_test, X_unscaled = None, y_unscaled = Non
         if 'min_lag' not in kwargs:
             kwargs['min_lag'] = 0
         if 'LCEN_cutoff' not in kwargs:
-            kwargs['LCEN_cutoff'] = 4e-3
+            kwargs['LCEN_cutoff'] = 4e-2
         if 'LCEN_interaction' not in kwargs:
             kwargs['LCEN_interaction'] = True
         if 'LCEN_transform_y' not in kwargs:
             kwargs['LCEN_transform_y'] = False
+        if 'LCEN_clip_min_classes_selected' not in kwargs:
+            kwargs['LCEN_clip_min_classes_selected'] = 1
+        elif kwargs['classification'] and kwargs['LCEN_clip_min_classes_selected'] > len(set(y)):
+            raise ValueError(f'The "LCEN_clip_min_classes_selected" parameter should be <= the number of classes in the data. The value input for "LCEN_clip_min_classes_selected" was {kwargs["LCEN_clip_min_classes_selected"]}, but only {len(set(y))} classes were detected in the data.')
         kwargs['selection'] = None # for the _LCEN_joblib_fun called below
         kwargs['all_pos_X'] = np.all(X >= 0, axis = 0) & np.all(X_test >= 0, axis = 0) # Whether all entries in X are positive; used in _feature_trans() inside regression_models.py
         kwargs['all_pos_y'] = np.all(y >= 0, axis = 0) & np.all(y_test >= 0, axis = 0) # Whether all entries in y are positive; used in _feature_trans() inside regression_models.py
-        # First run for variable selection using a L1_ratio of 1 (that is, only using an L1 penalty)
-        hyperparam_prod = list(product(kwargs['degree'], [1], kwargs['alpha'], kwargs['lag']))
-        if kwargs['verbosity_level'] >= 2: print(f'Beginning variable selection runs. There are {len(hyperparam_prod)} hyperparameter combinations')
-        with Parallel(n_jobs = -1) as PAR:
-            if 'IC' in cv_type: # Information criterion
-                temp = PAR(delayed(_LCEN_joblib_fun)(X, y, X_test, y_test, eps, kwargs, prod_idx, this_prod) for prod_idx, this_prod in enumerate(hyperparam_prod))
-                temp = list(zip(*temp))[2] # To isolate the (AIC, AICc, BIC) tuple, which is the 3rd subentry of each entry in the original temp
-                temp = np.array(temp)
-                if cv_type == 'AICc':
-                    IC_result = temp[:, 1]
-                elif cv_type == 'BIC':
-                    IC_result = temp[:, 2]
-                else: # AIC
-                    IC_result = temp[:, 0]
-                ind = np.argmin(IC_result)
-            else: # Cross-validation
-                MSE_result = np.empty((len(kwargs['degree']) * len(kwargs['alpha']) * len(kwargs['lag']), K_fold*Nr)) * np.nan
-                for counter, (X_train, y_train, X_val, y_val) in enumerate(CVpartition(X, y, Type = cv_type, K = K_fold, Nr = Nr, group = group)):
-                    temp = PAR(delayed(_LCEN_joblib_fun)(X_train, y_train, X_val, y_val, eps, kwargs,
-                            prod_idx, this_prod, counter) for prod_idx, this_prod in enumerate(hyperparam_prod))
+        if kwargs['LCEN_LASSO_coeff_file'] is None or not os_exists(kwargs['LCEN_LASSO_coeff_file']):
+            # First run for variable selection using a L1_ratio of 1 (that is, only using an L1 penalty)
+            hyperparam_prod = list(product(kwargs['degree'], [1], kwargs['alpha'], kwargs['lag']))
+            if kwargs['verbosity_level'] >= 2: print(f'LCEN: beginning LASSO runs for feature selection. There are {len(hyperparam_prod)} hyperparameter combinations')
+            with Parallel(n_jobs = -1) as PAR:
+                if 'IC' in cv_type: # Information criterion
+                    temp = PAR(delayed(_LCEN_joblib_fun)(X, y, X_test, y_test, eps, kwargs, prod_idx, this_prod) for prod_idx, this_prod in enumerate(hyperparam_prod))
+                    temp = list(zip(*temp))[2] # To isolate the (AIC, AICc, BIC) tuple, which is the 3rd subentry of each entry in the original temp
+                    temp = np.array(temp)
+                    if cv_type == 'AICc':
+                        IC_result = temp[:, 1]
+                    elif cv_type == 'BIC':
+                        IC_result = temp[:, 2]
+                    else: # AIC
+                        IC_result = temp[:, 0]
+                    ind = np.argmin(IC_result)
+                else: # Cross-validation
+                    MSE_result = np.empty((len(kwargs['degree']) * len(kwargs['alpha']) * len(kwargs['lag']), K_fold*Nr)) * np.nan
+                    for counter, (X_train, y_train, X_val, y_val) in enumerate(CVpartition(X, y, cv_type, K_fold, Nr, kwargs['cv_random_state'], group)):
+                        temp = PAR(delayed(_LCEN_joblib_fun)(X_train, y_train, X_val, y_val, eps, kwargs,
+                                prod_idx, this_prod, counter) for prod_idx, this_prod in enumerate(hyperparam_prod))
+                        if not kwargs['classification']:
+                            MSE_result[:, counter], _, _ = zip(*temp)
+                        else:
+                            loss_dicts, _, _ = zip(*temp)
+                            MSE_result[:, counter] = [elem['MCC'] for elem in loss_dicts]
+                    # Best hyperparameters for the preliminary run
+                    MSE_mean = np.nanmean(MSE_result, axis = 1)
                     if not kwargs['classification']:
-                        MSE_result[:, counter], _, _ = zip(*temp)
+                        ind = np.nanargmin(MSE_mean) # Minimize the MSE
                     else:
-                        loss_dicts, _, _ = zip(*temp)
-                        MSE_result[:, counter] = [elem['MCC'] for elem in loss_dicts]
-                # Best hyperparameters for the preliminary run
-                MSE_mean = np.nanmean(MSE_result, axis = 1)
-                if not kwargs['classification']:
-                    ind = np.nanargmin(MSE_mean) # Minimize the MSE
-                else:
-                    ind = np.nanargmax(MSE_mean) # Maximize the MCC
-        # Run to obtain the coefficients when LCEN is run with L1_ratio = 1
-        degree, l1_ratio, alpha, lag = hyperparam_prod[ind]
-        _, LCEN_params, _, _, _, _, label_names, _ = rm.LCEN_fitting(X, y, X_test, y_test, alpha, l1_ratio, degree, lag, kwargs['min_lag'], kwargs['trans_type'],
-                                        kwargs['LCEN_interaction'], kwargs['selection'], kwargs['LCEN_transform_y'], kwargs['all_pos_X'], kwargs['all_pos_y'],
-                                        kwargs['scale_X'], kwargs['scale_y'], kwargs['classification'], kwargs['class_weight'])
+                        ind = np.nanargmax(MSE_mean) # Maximize the MCC
+            # Run to obtain the coefficients when LCEN is run with L1_ratio = 1
+            degree, l1_ratio, LASSO_alpha, lag = hyperparam_prod[ind]
+            LCEN_model, LCEN_params, _, _, _, _, label_names, _ = rm.LCEN_fitting(X, y, X_test, y_test, LASSO_alpha, l1_ratio, degree, lag, kwargs['min_lag'], kwargs['trans_type'],
+                                            kwargs['LCEN_interaction'], kwargs['selection'], kwargs['LCEN_transform_y'], kwargs['all_pos_X'], kwargs['all_pos_y'],
+                                            kwargs['scale_X'], kwargs['scale_y'], kwargs['model_random_state'], kwargs['classification'])
+            if kwargs['LCEN_LASSO_coeff_file'] is not None:
+                import json
+                LASSO_coeff_file = {'degree': degree, 'l1_ratio': l1_ratio, 'LASSO_alpha': LASSO_alpha, 'lag': lag, 'LASSO_scaled_parameters': LCEN_params.tolist()}
+                with open(kwargs['LCEN_LASSO_coeff_file'], 'w') as f:
+                    json.dump(LASSO_coeff_file, f, indent = 4)
+            elif kwargs['verbosity_level'] >= 2: print('NOTE: The "LCEN_LASSO_coeff_file" parameter was not set. If testing multiple LCEN_cutoff values, it is recommended to set it to a .json file (that does not exist) so that future runs on the same dataset are faster.')
+        else:
+            import json
+            with open(kwargs['LCEN_LASSO_coeff_file']) as f:
+                temp_dict = json.load(f)
+            degree = temp_dict['degree']
+            l1_ratio = temp_dict['l1_ratio']
+            LASSO_alpha = temp_dict['LASSO_alpha']
+            lag = temp_dict['lag']
+            LCEN_params = np.array(temp_dict['LASSO_scaled_parameters'])
+            print(f'LCEN: read LASSO coefficients from file {kwargs["LCEN_LASSO_coeff_file"]}')
         kwargs['selection'] = (np.abs(LCEN_params) >= kwargs['LCEN_cutoff'])&(np.abs(LCEN_params) != 0) # 1st clip step
         if kwargs['classification']: # Classification generates one set of features per class, but there is no way (to my knowledge) to run the EN step with a different set of features for each class
-            kwargs['selection'] = np.any(kwargs['selection'], axis = 0)
+            kwargs['selection'] = kwargs['selection'].sum(axis = 0) >= kwargs['LCEN_clip_min_classes_selected']
 
         # Second run with a free L1_ratio but fixed degree and lag
         hyperparam_prod = list(product([degree], kwargs['l1_ratio'], kwargs['alpha'], [lag])) # Degree and lag have been fixed above
-        if kwargs['verbosity_level'] >= 2: print(f'Beginning real runs. There are {len(hyperparam_prod)} hyperparameter combinations')
+        if kwargs['verbosity_level'] >= 2: print(f'LCEN: beginning final runs. There are {len(hyperparam_prod)} hyperparameter combinations')
         with Parallel(n_jobs = -1) as PAR:
             if 'IC' in cv_type: # Information criterion
                 temp = PAR(delayed(_LCEN_joblib_fun)(X, y, X_test, y_test, eps, kwargs, prod_idx, this_prod) for prod_idx, this_prod in enumerate(hyperparam_prod))
@@ -332,7 +427,7 @@ def CV_mse(model_name, X, y, X_test, y_test, X_unscaled = None, y_unscaled = Non
             else:
                 MSE_result = np.empty((len(kwargs['alpha']) * len(kwargs['l1_ratio']), K_fold*Nr)) * np.nan
                 Var = np.empty((len(kwargs['alpha']) * len(kwargs['l1_ratio']), K_fold*Nr)) * np.nan # Used when robust_priority == True
-                for counter, (X_train, y_train, X_val, y_val) in enumerate(CVpartition(X, y, Type = cv_type, K = K_fold, Nr = Nr, group = group)):
+                for counter, (X_train, y_train, X_val, y_val) in enumerate(CVpartition(X, y, cv_type, K_fold, Nr, kwargs['cv_random_state'], group)):
                     temp = PAR(delayed(_LCEN_joblib_fun)(X_train, y_train, X_val, y_val, eps, kwargs, prod_idx,
                             this_prod, counter) for prod_idx, this_prod in enumerate(hyperparam_prod))
                     if not kwargs['classification']:
@@ -359,11 +454,13 @@ def CV_mse(model_name, X, y, X_test, y_test, X_unscaled = None, y_unscaled = Non
 
         # Hyperparameter setup
         degree, l1_ratio, alpha, lag = hyperparam_prod[ind]
-        hyperparams = {'degree': degree, 'l1_ratio': l1_ratio, 'alpha': alpha, 'lag': lag, 'cutoff': kwargs['LCEN_cutoff'], 'trans_type': kwargs['trans_type']}
+        hyperparams = {'degree': degree, 'LASSO_alpha': LASSO_alpha, 'l1_ratio': l1_ratio, 'EN_alpha': alpha, 'lag': lag, 'cutoff': kwargs['LCEN_cutoff'], 'trans_type': kwargs['trans_type']}
+        if kwargs['classification'] and len(set(y)) > 2: # The LCEN_clip_min_classes_selected is relevant only in multiclass classification
+            hyperparams['LCEN_clip_min_classes_selected'] = kwargs['LCEN_clip_min_classes_selected']
         # Final run with the test set and best hyperparameters
         LCEN_model, LCEN_params, _, _, _, _, label_names, ICs = rm.LCEN_fitting(X, y, X_test, y_test, alpha, l1_ratio, degree, lag, kwargs['min_lag'], kwargs['trans_type'],
                                         kwargs['LCEN_interaction'], kwargs['selection'], kwargs['LCEN_transform_y'], kwargs['all_pos_X'], kwargs['all_pos_y'],
-                                        kwargs['scale_X'], kwargs['scale_y'], kwargs['classification'], kwargs['class_weight'])
+                                        kwargs['scale_X'], kwargs['scale_y'], kwargs['model_random_state'], kwargs['classification'])
         label_names = label_names[kwargs['selection']]
         # Removing the features that had small coefficients after the final model selection (2nd clip step)
         if kwargs['classification'] and len( set(y.squeeze()) ) == 2: # Binary classification generates only one set of features for the positive class, but the set of features for the negative class is just that of the positive class * -1
@@ -386,9 +483,9 @@ def CV_mse(model_name, X, y, X_test, y_test, X_unscaled = None, y_unscaled = Non
             X, X_test, _ = rm._feature_trans(X, X_test, degree, kwargs['LCEN_interaction'], kwargs['trans_type'], kwargs['all_pos_X'], kwargs['all_pos_y'])
         if lag > 0:
             X_temp = np.hstack([X[lag-1-idx : -idx-1, :] for idx in range(kwargs['min_lag'], lag)]) # The additional entries representing the previous times (t-1 to t-lag)
-            y_temp = np.hstack([y[lag-1-idx : -idx-1] for idx in range(kwargs['min_lag'], lag)])
+            y_temp = np.hstack([y[lag-1-idx:] if idx == 0 else y[lag-1-idx : -idx] for idx in range(kwargs['min_lag'], lag)])[lag:]
             X_test_temp = np.hstack([np.concatenate((X[X.shape[0]-idx-1:, :], X_test[: -idx-1, :])) for idx in range(kwargs['min_lag'], lag)]) # No need to remove entries from X_test or y_test because we can use the data from the final points of X or y to predict the initial points of X_test or y_test
-            y_test_temp = np.hstack([np.concatenate((y[(len(y)-idx-1):],  y_test[: -idx-1])) for idx in range(kwargs['min_lag'], lag)])
+            y_test_temp = np.hstack([y_test if idx == 0 else np.concatenate((y[(len(y)-idx):],  y_test[:-idx])) for idx in range(kwargs['min_lag'], lag)])
             X = np.hstack((X[lag:], X_temp, y_temp))
             y = y[lag:] # Shorterning y
             X_test = np.hstack((X_test, X_test_temp, y_test_temp))
@@ -404,7 +501,7 @@ def CV_mse(model_name, X, y, X_test, y_test, X_unscaled = None, y_unscaled = Non
             y_vars = [np.array(['y' in var for var in elem], dtype = bool) for elem in label_names]
         if len(label_names) and kwargs['scale_X'] and kwargs['scale_y'] and not kwargs['classification']: # Both X and y were scaled; regression [there should not be any classification with scaled y]
             LCEN_params_unscaled[~y_vars] = LCEN_params[~y_vars] * y.std() / X[:, kwargs['selection']][:, final_selection].std(axis=0)[~y_vars] # Unscaling the X variables # TODO: sometimes, when lag and min_lag > 0, an indexing problem occurs. Add [:, -len(kwargs['selection']):] before any X indexing to fix it
-            LCEN_params_unscaled[y_vars] = LCEN_params[y_vars]
+            LCEN_params_unscaled[y_vars] = LCEN_params[y_vars] * y.std() / X[:, kwargs['selection']][:, final_selection].std(axis=0)[y_vars]
         elif len(label_names) and kwargs['scale_X'] and not kwargs['classification']: # Only X was scaled; regression
             LCEN_params_unscaled[~y_vars] = LCEN_params[~y_vars] / X[:, kwargs['selection']][:, final_selection].std(axis=0)[~y_vars] # Unscaling the X variables # TODO: sometimes, when lag and min_lag > 0, an indexing problem occurs. Add [:, -len(kwargs['selection']):] before any X indexing to fix it
             LCEN_params_unscaled[y_vars] = LCEN_params[y_vars]
@@ -415,7 +512,7 @@ def CV_mse(model_name, X, y, X_test, y_test, X_unscaled = None, y_unscaled = Non
         elif len(label_names) and kwargs['scale_y']: # Only y was scaled; regression
             if len(kwargs['all_pos_X']) and kwargs['verbosity_level']: print('WARNING: the unscaled coefficients are offset by a single constant. Fix TODO.') # TODO: if there is no X, this unscaling issue probably does not occur. len(kwargs['all_pos_X']) == 0 if there is no X
             LCEN_params_unscaled[~y_vars] = LCEN_params[~y_vars] * y.std()
-            LCEN_params_unscaled[y_vars] = LCEN_params[y_vars]
+            LCEN_params_unscaled[y_vars] = LCEN_params[y_vars] * y.std()
         elif len(label_names): # No scaling. If len(label_names) == False, no variables were selected
             LCEN_params_unscaled = LCEN_params
         # Obtaining the predictions again since coefficients may have been removed
@@ -436,33 +533,51 @@ def CV_mse(model_name, X, y, X_test, y_test, X_unscaled = None, y_unscaled = Non
                 scaler_x.fit(X)
                 X = scaler_x.transform(X)
                 X_test = scaler_x.transform(X_test)
-            yhat_train = LCEN_model.predict_proba(X[:, kwargs['selection']])
-            yhat_test = LCEN_model.predict_proba(X_test[:, kwargs['selection']])
+            if LCEN_model is not None:
+                yhat_train = LCEN_model.predict_proba(X[:, kwargs['selection']])
+                yhat_test = LCEN_model.predict_proba(X_test[:, kwargs['selection']])
+            else:
+                _, class_counts = np.unique(y, return_counts = True)
+                most_common_class = np.argmax(class_counts)
+                yhat_train = np.zeros( (X.shape[0], len(class_counts)) ); yhat_train[:, most_common_class] = 1
+                yhat_test = np.zeros( (X_test.shape[0], len(class_counts)) ); yhat_test[:, most_common_class] = 1
             if len( set(y.squeeze()) ) == 2: # Binary classification
-                pred_class_train = (yhat_train[:, 1] >= 0.5).astype(int) # TODO: for binary classification, allow thresholds
-                pred_class_test = (yhat_test[:, 1] >= 0.5).astype(int)
+                pred_class_train = (yhat_train[:, 1] >= 0.5).astype(int) + y.min() # y.min() is a correction because classes may not start from 0 # TODO: for binary classification, allow thresholds
+                pred_class_test = (yhat_test[:, 1] >= 0.5).astype(int) + y.min() # y.min() is a correction because classes may not start from 0
             else: # Multi-class classification
-                pred_class_train = yhat_train.argmax(axis=1)
-                pred_class_test = yhat_test.argmax(axis=1)
-            loss_train = rm._classification_score(y, pred_class_train, kwargs['class_weight'])
-            loss_test = rm._classification_score(y_test, pred_class_test, kwargs['class_weight'])
+                pred_class_train = yhat_train.argmax(axis=1) + y.min() # y.min() is a correction because classes may not start from 0
+                pred_class_test = yhat_test.argmax(axis=1) + y.min() # y.min() is a correction because classes may not start from 0
+            loss_train = rm._classification_score(y, pred_class_train)
+            loss_test = rm._classification_score(y_test, pred_class_test)
         # Returning the results
         if kwargs['verbosity_level'] >= 3 and not kwargs['classification']:
             print(f'{len(LCEN_params_unscaled) - int(label_names[0] == "intercept")} variables {"(and intercept)"*(label_names[0] == "intercept")} were selected' + ' '*20)
             print(f'The validation MSE was {MSE_mean[ind]:.3e}')
         elif kwargs['verbosity_level'] >= 3:
             print(f'The validation MCC was {MSE_mean[ind]:.3e}')
+        # Transforming numpy arrays of features to list so that they can be saved within a .json file, and adding label names next to each feature
         if not kwargs['classification']:
             LCEN_params_unscaled = list(zip(label_names, LCEN_params_unscaled))
-        else:
+            if len(label_names):
+                add_intercept = int(label_names[0] == 'intercept') # Potentially removing the intercept, as the unscaled parameters may have it but the scaled parameters never do
+                LCEN_params = list(zip(label_names[add_intercept:], LCEN_params))
+            else:
+                LCEN_params = list(zip(label_names, LCEN_params)) # Just another empty list so we return something for LCEN_params
+        elif label_names: # Classification and at least one feature was selected
             temp_vars = {}
+            temp_vars_scaled = {}
             for this_class in range(len( set(y.squeeze()) )):
                 temp_vars[f'Class {this_class}'] = list(zip(label_names[this_class], LCEN_params_unscaled[this_class]))
+                temp_vars_scaled[f'Class {this_class}'] = list(zip(label_names[this_class], LCEN_params[this_class]))
             LCEN_params_unscaled = temp_vars
+            LCEN_params = temp_vars_scaled
+        else: # Classification and no features were selected
+            LCEN_params_unscaled = []
+            LCEN_params = []
         if 'IC' in cv_type:
-            return(hyperparams, LCEN_model, LCEN_params_unscaled, loss_train, loss_test, yhat_train, yhat_test, IC_result[ind])
+            return(hyperparams, LCEN_model, LCEN_params_unscaled, LCEN_params, loss_train, loss_test, yhat_train, yhat_test, IC_result[ind])
         else:
-            return(hyperparams, LCEN_model, LCEN_params_unscaled, loss_train, loss_test, yhat_train, yhat_test, MSE_mean[ind])
+            return(hyperparams, LCEN_model, LCEN_params_unscaled, LCEN_params, loss_train, loss_test, yhat_train, yhat_test, MSE_mean[ind])
 
     elif model_name == 'RF' or model_name == 'GBDT':
         if 'RF_n_estimators' not in kwargs:
@@ -473,7 +588,7 @@ def CV_mse(model_name, X, y, X_test, y_test, X_unscaled = None, y_unscaled = Non
             kwargs['RF_min_samples_leaf'] = [0.001, 0.01, 0.02, 0.05, 0.1]
         if 'RF_n_features' not in kwargs:
             kwargs['RF_n_features'] = [0.1, 0.25, 0.333, 0.5, 0.667, 0.75, 1.0]
-        # learning_rate matters only for GBDT -- set it to None to use RFs
+        # learning_rate matters only for GBDT — set it to None to use RFs
         if model_name == 'RF':
             kwargs['learning_rate'] = [None]
         elif 'learning_rate' not in kwargs or len(kwargs['learning_rate']) == 0:
@@ -492,8 +607,8 @@ def CV_mse(model_name, X, y, X_test, y_test, X_unscaled = None, y_unscaled = Non
         """
 
         with Parallel(n_jobs = -1) as PAR:
-            for counter, (X_train, y_train, X_val, y_val) in enumerate(CVpartition(X_unscaled, y_unscaled, Type = cv_type, K = K_fold, Nr = Nr, group = group)):
-                print(f'{model_name}: Beginning fold {counter+1}', end = '\r')
+            for counter, (X_train, y_train, X_val, y_val) in enumerate(CVpartition(X_unscaled, y_unscaled, cv_type, K_fold, Nr, kwargs['cv_random_state'], group)):
+                if kwargs['verbosity_level'] >= 2: print(f'{model_name}: Beginning fold {counter+1}', end = '\r')
                 # Rescaling here to avoid validation dataset leakage
                 if kwargs['scale_X'] and len(X.shape) == 2 and X.shape[1] > 0: # StandardScaler doesn't work with 3D arrays or with arrays that are 2D but empty in one dimension
                     scaler_x = StandardScaler(with_mean=True, with_std=True)
@@ -512,7 +627,7 @@ def CV_mse(model_name, X, y, X_test, y_test, X_unscaled = None, y_unscaled = Non
                     y_train_scale = y_train
                     y_val_scale = y_val
                 temp = PAR(delayed(rm.forest_fitting)(X_train_scale, y_train_scale, X_val_scale, y_val_scale, this_prod[0], this_prod[1], this_prod[2], this_prod[3],
-                                    this_prod[4], classification = kwargs['classification'], class_weight = kwargs['class_weight']) for this_prod in hyperparam_prod)
+                                    this_prod[4], classification = kwargs['classification']) for this_prod in hyperparam_prod)
                 if not kwargs['classification']:
                     _, _, MSE_result[:, counter], _, _ = zip(*temp)
                 else:
@@ -540,7 +655,7 @@ def CV_mse(model_name, X, y, X_test, y_test, X_unscaled = None, y_unscaled = Non
             hyperparams = {'n_estimators': n_estimators, 'max_depth': max_depth, 'min_samples_leaf': min_samples_leaf, 'n_features': n_features, 'learning_rate': learning_rate}
         # Fit the final model
         RF_model, loss_train, loss_test, yhat_train, yhat_test = rm.forest_fitting(X, y, X_test, y_test, n_estimators, max_depth, min_samples_leaf,
-                                                            n_features, classification = kwargs['classification'], class_weight = kwargs['class_weight'])
+                                                            n_features, classification = kwargs['classification'])
         return(hyperparams, RF_model, loss_train, loss_test, yhat_train, yhat_test, MSE_mean[ind])
 
     elif model_name == 'SVM':
@@ -569,8 +684,8 @@ def CV_mse(model_name, X, y, X_test, y_test, X_unscaled = None, y_unscaled = Non
         """
 
         with Parallel(n_jobs = -1) as PAR:
-            for counter, (X_train, y_train, X_val, y_val) in enumerate(CVpartition(X_unscaled, y_unscaled, Type = cv_type, K = K_fold, Nr = Nr, group = group)):
-                print(f'{model_name}: Beginning fold {counter+1}', end = '\r')
+            for counter, (X_train, y_train, X_val, y_val) in enumerate(CVpartition(X_unscaled, y_unscaled, cv_type, K_fold, Nr, kwargs['cv_random_state'], group)):
+                if kwargs['verbosity_level'] >= 2: print(f'{model_name}: Beginning fold {counter+1}', end = '\r')
                 # Rescaling here to avoid validation dataset leakage
                 if kwargs['scale_X'] and len(X.shape) == 2 and X.shape[1] > 0: # StandardScaler doesn't work with 3D arrays or with arrays that are 2D but empty in one dimension
                     scaler_x = StandardScaler(with_mean=True, with_std=True)
@@ -593,8 +708,7 @@ def CV_mse(model_name, X, y, X_test, y_test, X_unscaled = None, y_unscaled = Non
                     temp = PAR(delayed(rm.SVM_fitting)(X_train_scale, y_train_scale, X_val_scale, y_val_scale, this_prod[0], this_prod[1], this_prod[2]) for this_prod in hyperparam_prod)
                     _, _, MSE_result[:, counter], _, _ = zip(*temp)
                 else: # SVM for classification does not use the epsilon hyperparameter
-                    temp = PAR(delayed(rm.SVM_fitting)(X_train_scale, y_train_scale, X_val_scale, y_val_scale, this_prod[0], this_prod[1], classification = kwargs['classification'],
-                                        class_weight = kwargs['class_weight']) for this_prod in hyperparam_prod)
+                    temp = PAR(delayed(rm.SVM_fitting)(X_train_scale, y_train_scale, X_val_scale, y_val_scale, this_prod[0], this_prod[1], classification = True) for this_prod in hyperparam_prod)
                     _, _, loss_dicts, _, _ = zip(*temp)
                     MSE_result[:, counter] = [elem['MCC'] for elem in loss_dicts]
 
@@ -619,7 +733,7 @@ def CV_mse(model_name, X, y, X_test, y_test, X_unscaled = None, y_unscaled = Non
         else:
             gamma, C = hyperparam_prod[ind]
             hyperparams = {'gamma': gamma, 'C': C}
-            SVM_model, loss_train, loss_test, yhat_train, yhat_test = rm.SVM_fitting(X, y, X_test, y_test, gamma, C, classification = True, class_weight = kwargs['class_weight']) # Fitting the final model
+            SVM_model, loss_train, loss_test, yhat_train, yhat_test = rm.SVM_fitting(X, y, X_test, y_test, gamma, C, classification = True) # Fitting the final model
         return(hyperparams, SVM_model, loss_train, loss_test, yhat_train, yhat_test, MSE_mean[ind])
 
     elif model_name == 'AdaB':
@@ -632,7 +746,7 @@ def CV_mse(model_name, X, y, X_test, y_test, X_unscaled = None, y_unscaled = Non
         MSE_result = np.empty( (len(kwargs['RF_n_estimators']) * len(kwargs['learning_rate']), K_fold*Nr) ) * np.nan
 
         with Parallel(n_jobs = -1) as PAR:
-            for counter, (X_train, y_train, X_val, y_val) in enumerate(CVpartition(X_unscaled, y_unscaled, Type = cv_type, K = K_fold, Nr = Nr, group = group)):
+            for counter, (X_train, y_train, X_val, y_val) in enumerate(CVpartition(X_unscaled, y_unscaled, cv_type, K_fold, Nr, kwargs['cv_random_state'], group)):
                 # Rescaling here to avoid validation dataset leakage
                 if kwargs['scale_X'] and len(X.shape) == 2 and X.shape[1] > 0: # StandardScaler doesn't work with 3D arrays or with arrays that are 2D but empty in one dimension
                     scaler_x = StandardScaler(with_mean=True, with_std=True)
@@ -651,7 +765,7 @@ def CV_mse(model_name, X, y, X_test, y_test, X_unscaled = None, y_unscaled = Non
                     y_train_scale = y_train
                     y_val_scale = y_val
                 temp = PAR(delayed(rm.AdaBoost_fitting)(X_train_scale, y_train_scale, X_val_scale, y_val_scale, this_prod[0], this_prod[1],
-                                    classification = kwargs['classification'], class_weight = kwargs['class_weight']) for this_prod in hyperparam_prod)
+                                    classification = kwargs['classification']) for this_prod in hyperparam_prod)
                 if not kwargs['classification']:
                     _, _, MSE_result[:, counter], _, _ = zip(*temp)
                 else:
@@ -667,19 +781,26 @@ def CV_mse(model_name, X, y, X_test, y_test, X_unscaled = None, y_unscaled = Non
         n_estimators, learning_rate = hyperparam_prod[ind]
         hyperparams = {'n_estimators': n_estimators, 'learning_rate': learning_rate}
         # Fit the final model
-        AdaB_model, loss_train, loss_test, yhat_train, yhat_test = rm.AdaBoost_fitting(X, y, X_test, y_test, n_estimators, learning_rate, classification = kwargs['classification'], class_weight = kwargs['class_weight'])
+        AdaB_model, loss_train, loss_test, yhat_train, yhat_test = rm.AdaBoost_fitting(X, y, X_test, y_test, n_estimators, learning_rate, classification = kwargs['classification'])
         return(hyperparams, AdaB_model, loss_train, loss_test, yhat_train, yhat_test, MSE_mean[ind])
 
     elif model_name in {'MLP', 'RNN'}:
-        # Loss function
         kwargs['device'] = 'cuda' if torch.cuda.is_available() else 'cpu'
-        if 'classification' not in kwargs or not kwargs['classification']:
+        # Loss function
+        if not kwargs['classification']:
             loss_function = torch.nn.functional.mse_loss
+        elif 'diff_MCC_gamma' in kwargs and kwargs['diff_MCC_gamma'] is not None:
+            loss_function = differentiable_MCC
         else:
             loss_function = torch.nn.CrossEntropyLoss(weight = torch.Tensor(kwargs['class_weight'])).to(kwargs['device'])
+            kwargs['diff_MCC_gamma'] = None
         # Layer hyperparameters
         if kwargs['classification']:
             myshape_y = len( set(y.squeeze()) )
+            min_y = y.min() # y.min() is a correction because classes may not start from 0
+            y -= min_y
+            y_unscaled -= min_y
+            y_test -= min_y
         else:
             myshape_y = y.shape[1]
         if 'MLP_layers' not in kwargs or kwargs['MLP_layers'] is None:
@@ -738,35 +859,57 @@ def CV_mse(model_name, X, y, X_test, y_test, X_unscaled = None, y_unscaled = Non
             Results are saved in the kwargs['val_loss_file'] .csv file.
             """
             # File to record the validation losses
-            try:
-                final_val_loss = pd.read_csv(kwargs['val_loss_file'], index_col = [0, 1])
-            except FileNotFoundError:
-                if kwargs['verbosity_level'] >= 2: print('NOTE: no validation loss file was found, so the cross-validation will begin from the first set of hyperparameters.')
-                my_prod = list(product(kwargs['activation'], kwargs['learning_rate']))
-                my_idx = pd.MultiIndex.from_tuples(my_prod)
-                final_val_loss = pd.DataFrame(np.nan, index = my_idx, columns = [str(elem) for elem in kwargs['MLP_layers']])
+            if isinstance(kwargs['val_loss_file'], str):
+                try:
+                    if isinstance(loss_function, torch.nn.CrossEntropyLoss) or ('__name__' in dir(loss_function) and loss_function.__name__ == 'mse_loss'):
+                        index_col = [0, 1]
+                    elif '__name__' in dir(loss_function) and loss_function.__name__ == 'differentiable_MCC':
+                        index_col = [0, 1, 2]
+                    final_val_loss = pd.read_csv(kwargs['val_loss_file'], index_col = index_col)
+                except FileNotFoundError:
+                    if kwargs['verbosity_level'] >= 2: print('NOTE: no validation loss file was found, so the cross-validation will begin from the first set of hyperparameters.')
+                    if '__name__' in dir(loss_function) and loss_function.__name__ == 'differentiable_MCC':
+                        my_prod = list(product(kwargs['activation'], kwargs['learning_rate'], kwargs['diff_MCC_gamma']))
+                    else:
+                        my_prod = list(product(kwargs['activation'], kwargs['learning_rate']))
+                    my_idx = pd.MultiIndex.from_tuples(my_prod)
+                    final_val_loss = pd.DataFrame(np.nan, index = my_idx, columns = [str(elem) for elem in kwargs['MLP_layers']])
+            else:
+                final_val_loss = kwargs['val_loss_file'] # TODO: setup to pass a val_loss_file and a path
 
             # Train and validate
-            if hyperparam_list is None:
+            if '__name__' in dir(loss_function) and loss_function.__name__ == 'differentiable_MCC' and hyperparam_list is None:
+                hyperparam_list = list(product(kwargs['MLP_layers'], kwargs['learning_rate'], kwargs['activation'], kwargs['diff_MCC_gamma'])) # TODO: most likely, we can always pass kwargs['gamma'] anyways since there is a check for loss_function.__name__. If so, we can simplify this and other lines (e.g.: expand hyperparameter search)
+            elif hyperparam_list is None:
                 hyperparam_list = list(product(kwargs['MLP_layers'], kwargs['learning_rate'], kwargs['activation']))
             for cur_idx, cur_hp in enumerate(hyperparam_list): # cur_hp is (layers, lr, activation)
                 # We added a new layer configuration to the hyperparameters
                 if not str(cur_hp[0]) in list(final_val_loss.columns):
                     final_val_loss.insert(kwargs['MLP_layers'].index(cur_hp[0]), str(cur_hp[0]), np.nan) # layers.index to ensure consistent order
                 # We added a new activation or learning rate to the hyperparameters
-                if not (cur_hp[2], cur_hp[1]) in final_val_loss.index.to_list():
+                if '__name__' in dir(loss_function) and loss_function.__name__ == 'differentiable_MCC' and not (cur_hp[2], cur_hp[1], cur_hp[3]) in final_val_loss.index.to_list():
+                    final_val_loss.loc[(cur_hp[2], cur_hp[1], cur_hp[3]), :] = np.nan
+                    final_val_loss = final_val_loss.sort_index(ascending = [True, False, False]) # Sorting the indices
+                elif (isinstance(loss_function, torch.nn.CrossEntropyLoss) or ('__name__' in dir(loss_function) and loss_function.__name__ == 'mse_loss')) and not (cur_hp[2], cur_hp[1]) in final_val_loss.index.to_list(): # Need to manually check for the other loss functions else this gets called every time
                     final_val_loss.loc[(cur_hp[2], cur_hp[1]), :] = np.nan
                     final_val_loss = final_val_loss.sort_index(ascending = [True, False]) # Sorting the indices
 
+                # Determining whether we have already ran this combination of hyperparameters
+                if '__name__' in dir(loss_function) and loss_function.__name__ == 'differentiable_MCC':
+                    not_already_done = np.isnan( final_val_loss.at[(cur_hp[2], cur_hp[1], cur_hp[3]), str(cur_hp[0])] )
+                    first_print = f'{loss_function.__name__} (weight = {kwargs["class_weight"]}): Beginning hyperparameters {cur_idx+1:2}/{len(hyperparam_list)}; layers = {cur_hp[0]}, LR = {cur_hp[1]}, act = {cur_hp[2]}, gamma = {cur_hp[3]}'
+                else:
+                    not_already_done = np.isnan( final_val_loss.at[(cur_hp[2], cur_hp[1]), str(cur_hp[0])] )
+                    loss_name = f'CE (weight = {kwargs["class_weight"]})' if isinstance(loss_function, torch.nn.CrossEntropyLoss) else 'MSE'
+                    first_print = f'{loss_name}: Beginning hyperparameters {cur_idx+1:2}/{len(hyperparam_list)}; layers = {cur_hp[0]}, LR = {cur_hp[1]}, act = {cur_hp[2]}'
+
                 # Run CV only if we do not have validation losses for this set of parameters
-                if np.isnan( final_val_loss.at[(cur_hp[2], cur_hp[1]), str(cur_hp[0])] ):
-                    if kwargs['verbosity_level'] >= 2:
-                        print(f'Beginning hyperparameters {cur_idx+1:3}/{len(hyperparam_list)}: MLP layers = {cur_hp[0]}; LR = {cur_hp[1]}; activation = {cur_hp[2]}   ', end = '\r')
+                if not_already_done:
+                    if kwargs['verbosity_level'] >= 2: print(first_print + ' '*7, end = '\r')
                     scheduler_min_lr = kwargs['scheduler_min_lr'] * cur_hp[1]
                     temp_val_loss = 0
-                    for counter, (X_train, y_train, X_val, y_val) in enumerate(CVpartition(X_unscaled, y_unscaled, Type = cv_type, K = K_fold, Nr = Nr, group = group)):
-                        if kwargs['verbosity_level'] >= 3:
-                            print(f'Current fold: {counter+1}', end = '\r')
+                    for counter, (X_train, y_train, X_val, y_val) in enumerate(CVpartition(X_unscaled, y_unscaled, cv_type, K_fold, Nr, kwargs['cv_random_state'], group)):
+                        if kwargs['verbosity_level'] >= 3: print(f'Current fold: {counter+1}' + ' '*18, end = '\r')
                         # Rescaling to avoid validation dataset leakage
                         if kwargs['scale_X'] and len(X.shape) == 2 and X.shape[1] > 0: # StandardScaler doesn't work with 3D arrays
                             scaler_x_train = StandardScaler(with_mean=True, with_std=True)
@@ -792,10 +935,7 @@ def CV_mse(model_name, X, y, X_test, y_test, X_unscaled = None, y_unscaled = Non
                         train_loader_fold = DataLoader(train_dataset_fold, kwargs['batch_size'], shuffle = True)
                         val_dataset_fold = MyDataset(X_val_scale, y_val_scale)
                         val_loader_fold = DataLoader(val_dataset_fold, kwargs['batch_size'], shuffle = True)
-                        if not kwargs['classification'] or isinstance(loss_function, torch.nn.CrossEntropyLoss): # Regression [MSE minimization] or classification + cross-entropy minimization
-                            best_metric_fold = 1000 * np.maximum(1, y_train_scale.max().item())
-                        else: # Classification + MCC maximization - TODO
-                            best_metric_fold = 0
+                        best_metric_fold = 1000 * np.maximum(1, y_train_scale.max().item()) # In regression, this should work but has not been fully tested. In classification, this gets compared to -F1, so any positive value is fine
                         epochs_with_improvement = []
                         epochs_with_improvement_print = []
                         # Declaring the model and optimizer
@@ -814,30 +954,45 @@ def CV_mse(model_name, X, y, X_test, y_test, X_unscaled = None, y_unscaled = Non
                         elif kwargs['scheduler'].casefold() == 'exponential':
                             scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, kwargs['scheduler_factor'])
                         for epoch in range(kwargs['n_epochs']):
-                            if kwargs['verbosity_level'] >= 4:
-                                print(f'Fold {counter+1}; epoch {epoch+1:2}/{kwargs["n_epochs"]}; Best Metric = {best_metric_fold:5.2f}; Imp: {epochs_with_improvement_print}', end = '\r')
-                            train_loss, _ = loop_model(model, optimizer, train_loader_fold, loss_function, epoch, kwargs['batch_size'], classification = kwargs['classification'], l1_penalty_factor = kwargs['l1_penalty_factor'])
-                            val_loss, _ = loop_model(model, optimizer, val_loader_fold, loss_function, epoch, kwargs['batch_size'], evaluation = True, classification = kwargs['classification'], l1_penalty_factor = kwargs['l1_penalty_factor'])
-                            if (not kwargs['classification'] and val_loss < best_metric_fold) or (kwargs['classification'] and val_loss > best_metric_fold):
+                            if kwargs['verbosity_level'] >= 4 and not kwargs['classification']:
+                                print(f'Fold {counter+1}; epoch {epoch+1:2}/{kwargs["n_epochs"]}; Best val loss = {best_metric_fold:5.2f}; Imp: {epochs_with_improvement_print}' + ' '*5, end = '\r')
+                            elif kwargs['verbosity_level'] >= 4:
+                                print(f'Fold {counter+1}; epoch {epoch+1:2}/{kwargs["n_epochs"]}; Best val F1 = {-best_metric_fold:6.4f}; Imp: {epochs_with_improvement_print}' + ' '*5, end = '\r')
+                            if '__name__' in dir(loss_function) and loss_function.__name__ == 'differentiable_MCC':
+                                train_loss, _ = loop_model(model, optimizer, train_loader_fold, loss_function, epoch, kwargs['batch_size'], myshape_y, classification = kwargs['classification'], gamma = cur_hp[3], loss_weight = kwargs['class_weight'], l1_penalty_factor = kwargs['l1_penalty_factor'])
+                                val_loss, _ = loop_model(model, optimizer, val_loader_fold, loss_function, epoch, kwargs['batch_size'], myshape_y, evaluation = True, classification = kwargs['classification'], gamma = cur_hp[3], loss_weight = kwargs['class_weight'], l1_penalty_factor = kwargs['l1_penalty_factor'])
+                            else:
+                                train_loss, _ = loop_model(model, optimizer, train_loader_fold, loss_function, epoch, kwargs['batch_size'], myshape_y, classification = kwargs['classification'], l1_penalty_factor = kwargs['l1_penalty_factor'])
+                                val_loss, _ = loop_model(model, optimizer, val_loader_fold, loss_function, epoch, kwargs['batch_size'], myshape_y, evaluation = True, classification = kwargs['classification'], l1_penalty_factor = kwargs['l1_penalty_factor'])
+                            # Recording the improvement if current val loss < best val loss
+                            if val_loss < best_metric_fold:
                                 best_metric_fold = val_loss
                                 epochs_with_improvement.append(epoch+1)
-                                epochs_with_improvement_print.append(f'{epoch+1}:{best_metric_fold:.1e}')
+                                if not kwargs['classification']:
+                                    epochs_with_improvement_print.append(f'{epoch+1}:{best_metric_fold:.1e}')
+                                else:
+                                    epochs_with_improvement_print.append(f'{epoch+1}:{-best_metric_fold:.3f}')
                             if 'scheduler' in locals() and scheduler.__module__ == 'torch.optim.lr_scheduler': # Pytorch built-in scheduler
                                 scheduler.step(val_loss)
                             elif 'scheduler' in locals():
                                 for param_group in optimizer.param_groups:
                                     param_group['lr'] = scheduler(epoch)
                         # Recording the validation loss for this fold
-                        if kwargs['verbosity_level'] >= 3:
-                            print(f'Fold {counter+1} done; Best Loss = {best_metric_fold:5.2f}; Improvement = {epochs_with_improvement}' + ' '*18)
+                        if kwargs['verbosity_level'] >= 3 and not kwargs['classification']:
+                            print(f'Fold {counter+1} done; Best val loss = {best_metric_fold:5.2f}; Improvement = {epochs_with_improvement}' + ' '*18)
+                        elif kwargs['verbosity_level'] >= 3:
+                            print(f'Fold {counter+1} done; Best val F1 = {-best_metric_fold:6.4f}; Improvement = {epochs_with_improvement}' + ' '*18)
                         temp_val_loss += best_metric_fold
                     # Saving the average validation loss after CV
-                    final_val_loss.at[(cur_hp[2], cur_hp[1]), str(cur_hp[0])] = temp_val_loss / (counter+1) # counter+1 because the correct value may be K_fold (for simple Kfold) or K_fold*Nr (for repeated K_fold)
-                    final_val_loss.to_csv(kwargs['val_loss_file'])
+                    if '__name__' in dir(loss_function) and loss_function.__name__ == 'differentiable_MCC':
+                        final_val_loss.at[(cur_hp[2], cur_hp[1], cur_hp[3]), str(cur_hp[0])] = temp_val_loss / (counter+1) # counter+1 because the correct value may be K_fold (for simple Kfold) or K_fold*Nr (for repeated K_fold)
+                    else:
+                        final_val_loss.at[(cur_hp[2], cur_hp[1]), str(cur_hp[0])] = temp_val_loss / (counter+1) # counter+1 because the correct value may be K_fold (for simple Kfold) or K_fold*Nr (for repeated K_fold)
+                    final_val_loss.to_csv(kwargs['val_loss_file']) # TODO: setup to pass a val_loss_file and a path
             return final_val_loss
         final_val_loss = CV_model(X_unscaled, y_unscaled, loss_function, cv_type, K_fold, Nr, group, kwargs)
         # Finding the best hyperparameters
-        best_idx, best_LR, best_neurons, best_act, best_act_loc = _get_best_hyperparameters(final_val_loss)
+        best_idx, best_LR, best_neurons, best_act, best_act_loc, best_diff_MCC_gamma = _get_best_hyperparameters(final_val_loss)
         # Checking whether the best hyperparameters are in the extremes of what was cross-validated
         extreme_LR = best_idx[0] in {best_act_loc.start, best_act_loc.stop-1} # Whether the best LR was either the highest or the lowest value checked for the best activation function
         layer_mask = np.array([len(elem) for elem in kwargs['MLP_layers']]) == len(best_neurons) # Check only MLP configurations with the same number of layers
@@ -881,16 +1036,25 @@ def CV_mse(model_name, X, y, X_test, y_test, X_unscaled = None, y_unscaled = Non
                 final_val_loss = CV_model(X_unscaled, y_unscaled, loss_function, cv_type, K_fold, Nr, group, kwargs)
             elif kwargs['expand_hyperparameter_search'].casefold() == 'single':
                 if 'new_LR' in locals() and 'new_neurons' in locals() and (new_neurons, new_LR, best_act) not in hyperparam_list: # Adding both a new LR and a new layer configuration
-                    hyperparam_list.append((new_neurons, new_LR, best_act))
+                    if '__name__' in dir(loss_function) and loss_function.__name__ == 'differentiable_MCC':
+                        hyperparam_list.append((new_neurons, new_LR, best_act, best_diff_MCC_gamma))
+                    else: # MSE and Cross-entropy
+                        hyperparam_list.append((new_neurons, new_LR, best_act))
                 if 'new_LR' in locals() and (best_neurons, new_LR, best_act) not in hyperparam_list: # Adding a new LR with the other best hyperparameters
-                    hyperparam_list.append((best_neurons, new_LR, best_act))
+                    if '__name__' in dir(loss_function) and loss_function.__name__ == 'differentiable_MCC':
+                        hyperparam_list.append((best_neurons, new_LR, best_act, best_diff_MCC_gamma))
+                    else: # MSE and Cross-entropy
+                        hyperparam_list.append((best_neurons, new_LR, best_act))
                     del new_LR # To avoid an infinite loop, as the if statement check for the presence of this variable in locals()
                 if 'new_neurons' in locals() and (new_neurons, best_LR, best_act) not in hyperparam_list: # Adding a new layer configuration with the other best hyperparameters
-                    hyperparam_list.append((new_neurons, best_LR, best_act))
+                    if '__name__' in dir(loss_function) and loss_function.__name__ == 'differentiable_MCC':
+                        hyperparam_list.append((best_neurons, new_LR, best_act, best_diff_MCC_gamma))
+                    else: # MSE and Cross-entropy
+                        hyperparam_list.append((new_neurons, best_LR, best_act))
                     del new_neurons # To avoid an infinite loop, as the if statement check for the presence of this variable in locals()
                 final_val_loss = CV_model(X_unscaled, y_unscaled, loss_function, cv_type, K_fold, Nr, group, kwargs, hyperparam_list)
             # Finding the best hyperparameters
-            best_idx, best_LR, best_neurons, best_act, best_act_loc = _get_best_hyperparameters(final_val_loss)
+            best_idx, best_LR, best_neurons, best_act, best_act_loc, best_diff_MCC_gamma = _get_best_hyperparameters(final_val_loss)
             # Checking whether the best hyperparameters are in the extremes of what was cross-validated
             extreme_LR = best_idx[0] in {best_act_loc.start, best_act_loc.stop-1} # Whether the best LR was either the highest or the lowest value checked for the best activation function
             layer_mask = np.array([len(elem) for elem in kwargs['MLP_layers']]) == len(best_neurons) # Check only MLP configurations with the same number of layers
@@ -912,9 +1076,9 @@ def CV_mse(model_name, X, y, X_test, y_test, X_unscaled = None, y_unscaled = Non
         if kwargs['scheduler'].casefold() in {'plateau', 'cosine'}: # The plateau scheduler cannot work here because there is no validation loss, so it gets switched for the cosine scheduler
             scheduler = CosineScheduler(kwargs['scheduler_last_epoch'], base_lr = best_LR, warmup_steps = kwargs['scheduler_warmup'], final_lr = best_LR * kwargs['scheduler_min_lr'])
         # Retrain
-        if kwargs['verbosity_level'] >= 2: print('Beginning final ANN training')
+        if kwargs['verbosity_level'] >= 2: print(f'Beginning final ANN training - MLP size = {best_neurons}; LR = {best_LR}; activation = {best_act}; batch size = {kwargs["batch_size"]}; weight_decay = {kwargs["weight_decay"]}')
         for epoch in range(kwargs['n_epochs']):
-            loop_model(model, optimizer, train_loader, loss_function, epoch, kwargs['batch_size'], classification = kwargs['classification'], l1_penalty_factor = kwargs['l1_penalty_factor'])
+            loop_model(model, optimizer, train_loader, loss_function, epoch, kwargs['batch_size'], myshape_y, classification = kwargs['classification'], gamma = best_diff_MCC_gamma, loss_weight = kwargs['class_weight'], l1_penalty_factor = kwargs['l1_penalty_factor'])
             if 'scheduler' in locals() and scheduler.__module__ == 'torch.optim.lr_scheduler': # Pytorch built-in scheduler
                 scheduler.step() # TODO: we do not really have a val_loss here. Need to check how the other built-in Schedulers behave
             elif 'scheduler' in locals():
@@ -929,7 +1093,8 @@ def CV_mse(model_name, X, y, X_test, y_test, X_unscaled = None, y_unscaled = Non
             train_y = torch.empty(len(train_loader.dataset))
         else:
             train_y = torch.empty(len(train_loader.dataset), dtype = torch.long)
-            loss_function = loss_function.cpu()
+            if not ('__name__' in dir(loss_function) and loss_function.__name__ == 'differentiable_MCC'):
+                loss_function = loss_function.cpu()
         for idx, data in enumerate(train_loader):
             X_finaleval, y_finaleval = data # _finaleval to avoid overwriting the original X and y
             X_finaleval = X_finaleval.cuda()
@@ -937,7 +1102,6 @@ def CV_mse(model_name, X, y, X_test, y_test, X_unscaled = None, y_unscaled = Non
             train_pred[idx*kwargs['batch_size']:(idx*kwargs['batch_size'])+len(pred), :] = pred
             train_y[idx*kwargs['batch_size']:(idx*kwargs['batch_size'])+len(y_finaleval)] = y_finaleval.squeeze()
         train_loss = loss_function(train_pred.squeeze(), train_y).item()
-        train_pred = np.array(train_pred, dtype = float)
         # Final evaluation - Test set
         test_dataset = MyDataset(torch.Tensor(X_test), y_test)
         test_loader = DataLoader(test_dataset, kwargs['batch_size'], shuffle = False) # Not shuffling because this is just for evaluation
@@ -953,7 +1117,6 @@ def CV_mse(model_name, X, y, X_test, y_test, X_unscaled = None, y_unscaled = Non
             test_pred[idx*kwargs['batch_size']:(idx*kwargs['batch_size'])+len(pred), :] = pred
             test_y[idx*kwargs['batch_size']:(idx*kwargs['batch_size'])+len(y_finaleval)] = y_finaleval.squeeze()
         test_loss = loss_function(test_pred.squeeze(), test_y).item()
-        test_pred = np.array(test_pred, dtype = float)
         best_hyperparameters = {'RNN size': str(kwargs['RNN_layers']), 'MLP size': str(best_neurons), 'LR': best_LR, 'activation': best_act, 'batch_size': kwargs['batch_size'], 'n_epochs': kwargs['n_epochs'], 'weight_decay': kwargs['weight_decay'], 'scheduler': kwargs['scheduler']}
         if kwargs['scheduler'].casefold() in {'plateau', 'lambda', 'step', 'multistep', 'exponential'}:
             best_hyperparameters['scheduler_factor'] = kwargs['scheduler_factor']
@@ -963,15 +1126,22 @@ def CV_mse(model_name, X, y, X_test, y_test, X_unscaled = None, y_unscaled = Non
             best_hyperparameters['scheduler_warmup'] = kwargs['scheduler_warmup']
             best_hyperparameters['scheduler_last_epoch'] = kwargs['scheduler_last_epoch']
             best_hyperparameters['scheduler_min_lr'] = kwargs['scheduler_min_lr']
-        if isinstance(loss_function, torch.nn.CrossEntropyLoss):
+        if kwargs['classification']:
             temp_train_loss = train_loss
-            pred_class_train = train_pred.argmax(axis = 1)
-            train_loss = rm._classification_score(y, pred_class_train, kwargs['class_weight'])
-            train_loss['Cross Entropy loss'] = temp_train_loss
+            train_pred = softmax(np.array(train_pred, dtype = float), axis = 1)
+            train_pred[train_pred < 1e-20] = 0 # For convenience to eliminate very small numbers
+            pred_class_train = train_pred.argmax(axis = 1) + min_y # min_y is a correction because classes may not start from 0
+            train_loss = rm._classification_score(y + min_y, pred_class_train)
             temp_test_loss = test_loss
-            pred_class_test = test_pred.argmax(axis = 1)
-            test_loss = rm._classification_score(y_test, pred_class_test, kwargs['class_weight'])
-            test_loss['Cross Entropy loss'] = temp_test_loss
+            test_pred = softmax(np.array(test_pred, dtype = float), axis = 1)
+            test_pred[test_pred < 1e-20] = 0 # For convenience to eliminate very small numbers
+            pred_class_test = test_pred.argmax(axis = 1) + min_y # min_y is a correction because classes may not start from 0
+            test_loss = rm._classification_score(y_test + min_y, pred_class_test)
+            if isinstance(loss_function, torch.nn.CrossEntropyLoss):
+                train_loss['Cross Entropy loss'] = temp_train_loss
+                test_loss['Cross Entropy loss'] = temp_test_loss
+            elif '__name__' in dir(loss_function) and loss_function.__name__ == 'differentiable_MCC':
+                best_hyperparameters['diff_MCC_gamma'] = best_diff_MCC_gamma
         return model, final_val_loss, train_loss, test_loss, train_pred, test_pred, best_hyperparameters
 
 @ignore_warnings()
@@ -986,7 +1156,7 @@ def _LCEN_joblib_fun(X_train, y_train, X_val, y_val, eps, kwargs, prod_idx, this
         print(f'Beginning run {prod_idx+1:4}', end = '\r')
     _, variable, _, mse, _, _, _, ICs = rm.LCEN_fitting(X_train, y_train, X_val, y_val, alpha, l1_ratio, degree, lag, kwargs['min_lag'], kwargs['trans_type'],
                             kwargs['LCEN_interaction'], kwargs['selection'], kwargs['LCEN_transform_y'], kwargs['all_pos_X'], kwargs['all_pos_y'],
-                            kwargs['scale_X'], kwargs['scale_y'], kwargs['classification'], kwargs['class_weight'])
+                            kwargs['scale_X'], kwargs['scale_y'], kwargs['model_random_state'], kwargs['classification'])
     return mse, np.sum(variable.flatten() != 0), ICs
 
 class MyDataset(Dataset):
@@ -1023,14 +1193,10 @@ class CosineScheduler: # For MLPs and RNNs. Code obtained from https://d2l.ai/ch
         return self.base_lr
 
 # A helper function that is called every epoch of training or validation for MLPs and RNNs
-def loop_model(model, optimizer, loader, loss_function, epoch, batch_size, evaluation = False, classification = False, l1_penalty_factor = 0):
+def loop_model(model, optimizer, loader, loss_function, epoch, batch_size, shape_y, evaluation = False, classification = False, gamma = 1, loss_weight = 1, l1_penalty_factor = 0):
     if evaluation:
         model.eval()
-        if loader.dataset.ydata.ndim > 1:
-            myshape_y = len(set(loader.dataset.ydata.squeeze(1).tolist())) # TODO: confirm that squeeze(1) is the right operation (and not squeeze(0))
-        else: # TODO: perhaps with squeeze(0), this if-else statement is not needed
-            myshape_y = len(set(loader.dataset.ydata.tolist()))
-        val_pred = torch.empty((len(loader.dataset), myshape_y))
+        val_pred = torch.empty((len(loader.dataset), shape_y))
         val_y = torch.empty((len(loader.dataset)), dtype = torch.long)
     else:
         model.train()
@@ -1046,15 +1212,7 @@ def loop_model(model, optimizer, loader, loss_function, epoch, batch_size, evalu
         pred = model(X, classification)
         if 'total_pred_y' not in locals():
             total_pred_y = torch.empty((len(loader.dataset), pred.shape[1]))
-            if len(y.shape) > 1:
-                real_y = torch.empty((len(loader.dataset), y.shape[1]))
-            else:
-                real_y = torch.empty(len(loader.dataset))
         total_pred_y[idx*batch_size:(idx*batch_size)+len(pred), :] = pred.cpu().detach()
-        if len(y.shape) > 1:
-            real_y[idx*batch_size:(idx*batch_size)+len(y), :] = y.cpu().detach()
-        else:
-            real_y[idx*batch_size:(idx*batch_size)+len(y)] = y.cpu().detach()
         # Group L1 penalty
         l1_penalty = 0
         if l1_penalty_factor:
@@ -1062,7 +1220,10 @@ def loop_model(model, optimizer, loader, loss_function, epoch, batch_size, evalu
             for parameter_name, parameter in params:
                 if 'weight' in parameter_name:
                     l1_penalty += torch.sum( np.sqrt(parameter.shape[0]) * torch.sqrt(torch.sum(parameter**2, axis=0)) )
-        loss = loss_function(pred.squeeze(1), y) + l1_penalty_factor * l1_penalty
+        if '__name__' in dir(loss_function) and loss_function.__name__ == 'differentiable_MCC':
+            loss = loss_function(pred.squeeze(1), y, loss_weight, gamma) + l1_penalty_factor * l1_penalty
+        else:
+            loss = loss_function(pred.squeeze(1), y) + l1_penalty_factor * l1_penalty
         total_loss += y.shape[0]*loss.item()/loader.dataset.ydata.shape[0]
         # Backpropagation
         if not evaluation:
@@ -1075,15 +1236,23 @@ def loop_model(model, optimizer, loader, loss_function, epoch, batch_size, evalu
     if evaluation and classification:
         val_pred_CM = val_pred.argmax(axis=1)
         CM = confusion_matrix(val_y, val_pred_CM) # Confusion matrix to make F1 calcs easier
-        if CM[1,1]+CM[1,0] and CM[1,1]+CM[0,1]: # Avoids dividing by 0
-            rec = CM[1,1]/(CM[1,1]+CM[1,0])
-            pre = CM[1,1]/(CM[1,1]+CM[0,1])
-        else:
-            rec, pre = 0, 0
-        if rec and pre: # Avoids dividing by 0 when calculating F1
-            total_loss = -2/(1/rec + 1/pre) # Calling it "total_loss" for convienience, but this is just the F1 score
+        if CM.shape[0] == 2: # Binary classification
+            if CM[1,1]+CM[1,0] and CM[1,1]+CM[0,1]: # Avoids dividing by 0
+                rec = CM[1,1]/(CM[1,1]+CM[1,0])
+                pre = CM[1,1]/(CM[1,1]+CM[0,1])
+            else:
+                rec, pre = 0, 0
+        else: # Multiclass classification
+            rec = np.diag(CM)/CM.sum(axis=1)
+            rec[np.isnan(rec)] = 0
+            pre = np.diag(CM)/CM.sum(axis=0)
+            pre[np.isnan(pre)] = 0
+        if np.any(rec) and np.any(pre): # Avoids dividing by 0 when calculating F1
+            total_loss = -2/(1/rec + 1/pre) # Calling it "total_loss" for convienience, but this is just the F1 score. A differentiable loss function is used above for backpropagation
         else:
             total_loss = 0
+        if CM.shape[0] > 2 and not isinstance(total_loss, (int, float)): # Multiclass classification
+            total_loss = total_loss.mean()
     return total_loss, total_pred_y
 
 # MLP or LSTM+MLP model
@@ -1148,9 +1317,37 @@ class my_ANN(torch.nn.Module):
         else:
             out = self.model(x)
         if classification:
-            return self.sigmoid(out)
+            probs = self.sigmoid(out)
+            probs = (probs.T / probs.sum(axis=1)).T # Normalizing the probabilties to 1
+            return probs
         else:
             return out
+
+def differentiable_MCC(pred, target, weight = None, gamma = 1):
+    """
+    MCC that is continuous instead of discrete for use as a loss function. See https://doi.org/10.48550/arXiv.2402.17131
+    In the binary case, if a prediction is 0.7 and the real label is positive, this prediction will contribute 0.7 to TP and 0.3 to FN
+    """
+    # These commented-out lines are used in the binary case. The non-commented lines work for all classification cases
+    # Note that, for the binary case, pred[:, 0] == 1 - pred[:, 1]
+    # p_t = pred[:, 1]*target + (1 - pred[:, 1]) * (1-target) # The probability of a correct prediction, independently of whether the true target is positive or negative
+    # TP = (p_t**gamma * target).sum() * weight
+    # FN = ((1-p_t)**gamma * target).sum() * weight
+    # FP = ((1-p_t)**gamma * (1-target)).sum()
+    # TN = (p_t**gamma * (1-target)).sum()
+    # MCC = (TP*TN - FP*FN) / torch.sqrt((TP+FP) * (TP+FN) * (TN+FP) * (TN+FN) + 1e-8) # 1e-8 to avoid division by 0, since we can't use if statements
+    ######
+    if weight is None:
+        weight = torch.ones(pred.shape[1]).to(pred.device) # Default: all classes have the same weight
+    p_t = torch.zeros(pred.shape[0]).to(pred.device) # The probability of a correct prediction, independently of the true target/true class
+    class_counts = torch.zeros(pred.shape[1], dtype = torch.float32).to(pred.device)
+    weighted_preds = torch.zeros_like(class_counts).to(pred.device)
+    for idx in range(pred.shape[1]):
+        p_t += pred[:, idx]**gamma * (target==idx) * weight[idx]
+        class_counts[idx] = ( (pred[:, idx]**gamma + (1-pred[:, idx])**gamma) * (target == idx) ).sum() * weight[idx] # A more normal way of calculating this is class_counts[idx] = (target==idx).sum() * weight[idx]. However, this fails to account for gamma, which also changes the class counts
+        weighted_preds += (pred[target==idx]**gamma * weight[idx]).sum(axis = 0)
+    MCC = ( p_t.sum()*class_counts.sum() - torch.dot(class_counts, weighted_preds) ) / (torch.sqrt( class_counts.sum()**2 - torch.dot(weighted_preds, weighted_preds) ) * torch.sqrt( class_counts.sum()**2 - torch.dot(class_counts, class_counts) ) + 1e-8)
+    return -MCC # Negative because we want to maximize the MCC
 
 def _get_best_hyperparameters(final_val_loss):
     """
@@ -1162,6 +1359,10 @@ def _get_best_hyperparameters(final_val_loss):
     best_neurons_str = final_val_loss.columns[best_idx[1]]
     best_act = final_val_loss.index[best_idx[0]][0]
     best_act_loc = final_val_loss.index.get_loc(best_act)
+    if len(final_val_loss.index[0]) == 3:
+        best_diff_MCC_gamma = final_val_loss.index[best_idx[0]][2]
+    else:
+        best_diff_MCC_gamma = None
     # Converting the best number of neurons from str to list
     best_neurons = []
     temp_number = []
@@ -1176,4 +1377,4 @@ def _get_best_hyperparameters(final_val_loss):
         if elem in {')'}: # Also finished a tuple
             best_neurons.append(tuple(temp_tuple))
             temp_tuple = []
-    return best_idx, best_LR, best_neurons, best_act, best_act_loc
+    return best_idx, best_LR, best_neurons, best_act, best_act_loc, best_diff_MCC_gamma
