@@ -19,7 +19,8 @@ all_dependencies = [
         'openpyxl>=3.0.9',
         'xlrd>=2.0.1',
         'ace-cream>=0.4',
-        'torch>=2.0.0']
+        'torch>=2.0.0',
+        'skglm>=0.3.1']
 
 try: # Regular install with ace-cream
     setup(name = name, author = author, author_email = author_email, license = license, version = version, description = description, zip_safe = False, packages = packages, package_dir = package_dir, install_requires = all_dependencies)
